@@ -212,7 +212,18 @@ function partCursor(): string {
         r="4.2"
         :fill="cabinetStroke(p.cabinet)"
       />
-      <title>{{ p.code }} {{ p.name }} {{ p.origLen }}×{{ p.origWid }}（{{ p.cabinet }}）</title>
+      <g v-if="p.retained">
+        <rect :x="p.x + p.lenMm - 26" :y="p.y + 2" width="24" height="13" rx="2" fill="#15803d" />
+        <text
+          :x="p.x + p.lenMm - 14"
+          :y="p.y + 11.5"
+          text-anchor="middle"
+          font-size="9.5"
+          font-weight="700"
+          fill="#fff"
+        >留</text>
+      </g>
+      <title>{{ p.code }} {{ p.name }} {{ p.origLen }}×{{ p.origWid }}（{{ p.cabinet }}）{{ p.retained ? '· 改版留用旧摆法' : '' }}</title>
     </g>
     <!-- 刀路播放 -->
     <g v-if="showCuts">

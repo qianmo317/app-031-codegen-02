@@ -1,7 +1,15 @@
 <script setup lang="ts">
 import { computed, reactive } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob, exportJobJson } from '../lib/store'
+import {
+  getJob,
+  exportJobJson,
+  recordExport,
+  reissueExport,
+  activeExports,
+  voidedExports,
+  currentRevNo
+} from '../lib/store'
 import { printJob, type PrintSection } from '../lib/print'
 import { downloadText } from '../lib/format'
 import { toast } from '../lib/ui'
@@ -31,8 +39,25 @@ function doPrint(): void {
     toast('至少勾选一项导出内容', 'bad')
     return
   }
-  printJob(route.params.id as string, list)
+  const j = job.value
+  if (!j) return
+  // 本机存档：打印/导出即记账（文号+版号）；改版后旧文号自动作废，重发换新号
+  const doc = recordExport(j, list)
+  printJob(j.id, list, doc.documentId, doc.revNo)
+  toast(`已登记文号 ${doc.documentId}（第 ${revNo.value} 版）；改版后这份会自动作废并提示重发`, 'good', 4200)
 }
+function doReissue(docId: string): void {
+  const j = job.value
+  if (!j) return
+  const list = selected()
+  const r = reissueExport(j, docId, list)
+  if (!r) return
+  printJob(j.id, list, r.newDoc.documentId, r.newDoc.revNo)
+  toast(`旧文号 ${r.oldDoc.documentId} 已作废，已按文号 ${r.newDoc.documentId} 重发`, 'good', 4200)
+}
+const activeDocs = computed(() => (job.value ? activeExports(job.value) : []))
+const voidDocs = computed(() => (job.value ? voidedExports(job.value) : []))
+const revNo = computed(() => (job.value ? currentRevNo(job.value) : 0))
 function exportJson(): void {
   if (!job.value) return
   const safe = job.value.name.replace(/[\\/:*?"<>|]/g, '_')
@@ -63,6 +88,38 @@ function exportJson(): void {
         <div class="spacer" />
         <router-link :to="`/nest/${job.id}`">← 回排样图</router-link>
       </div>
+    </section>
+
+    <section class="panel" style="margin-top: 14px">
+      <h3 style="font-size: 14px; margin-bottom: 8px">下料单台账（当前第 {{ revNo }} 版）</h3>
+      <p class="small muted" style="margin: 0 0 8px">
+        每次打印/导出都记账。客户改图并应用改版后，旧版已发清单会自动作废；请在下方按新文号重发，车间只认「现行有效」的清单。
+      </p>
+      <table v-if="activeDocs.length || voidDocs.length" class="grid">
+        <thead>
+          <tr><th>文号</th><th>版号</th><th>导出时间</th><th>状态</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="doc in activeDocs" :key="doc.id">
+            <td><b>{{ doc.documentId }}</b></td>
+            <td>第 {{ doc.revNo }} 版</td>
+            <td class="small">{{ new Date(doc.at).toLocaleString('zh-CN') }}</td>
+            <td><span class="tag good">现行有效</span><span v-if="doc.replacedDocId" class="small muted">（重发自 {{ doc.replacedDocId }}）</span></td>
+            <td class="small muted">车间以此份为准</td>
+          </tr>
+          <tr v-for="doc in voidDocs" :key="doc.id" style="opacity: 0.7">
+            <td><s>{{ doc.documentId }}</s></td>
+            <td>第 {{ doc.revNo }} 版</td>
+            <td class="small">{{ new Date(doc.at).toLocaleString('zh-CN') }}</td>
+            <td><span class="tag" style="background: #fee2e2; color: #b91c1c">已作废</span><span v-if="doc.supersededBy" class="small muted"> → {{ doc.supersededBy }}</span></td>
+            <td>
+              <span class="small muted" style="margin-right: 8px">{{ doc.voidReason }}</span>
+              <button class="sm primary" @click="doReissue(doc.id)">按新版重发</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="small muted">还没有导出记录；点上方打印后会自动登记文号。</p>
     </section>
 
     <section v-if="!job.result" class="panel" style="margin-top: 14px">

@@ -280,6 +280,20 @@ export function rebuildFromPlacements(
   boardIndex: number,
   placements: Placement[]
 ): { steps: CutStep[]; leftovers: Rect[] } | null {
+  return rebuildFromPlacementsBudget(w, h, kerf, trim, boardIndex, placements, 800)
+}
+
+/** 同上，但可指定 DFS 尝试预算与是否先做刀线合并（改版留用旧板时预算更大）。 */
+export function rebuildFromPlacementsBudget(
+  w: number,
+  h: number,
+  kerf: number,
+  trim: number,
+  boardIndex: number,
+  placements: Placement[],
+  budget: number,
+  onlyMerge?: boolean
+): { steps: CutStep[]; leftovers: Rect[] } | null {
   const rects: PlacedRect[] = placements.map((p) => ({
     id: p.instanceId,
     x: p.x,
@@ -289,9 +303,10 @@ export function rebuildFromPlacements(
   }))
   const bounds: Rect = { x: trim, y: trim, w: w - 2 * trim, h: h - 2 * trim }
   let tries = 0
+  const mergeModes = onlyMerge === undefined ? [true, false] : [onlyMerge]
   for (const dec of enumerateGuillotine(rects, bounds, kerf)) {
-    for (const doMerge of [true, false]) {
-      if (++tries > 800) break
+    for (const doMerge of mergeModes) {
+      if (++tries > budget) break
       const steps = stepsFromSegs(dec.segs, w, h, kerf, trim, boardIndex, doMerge)
       const sim = simulate(w, h, kerf, steps, placements)
       if (sim.ok) return { steps, leftovers: dec.leftovers }

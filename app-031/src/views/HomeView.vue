@@ -28,6 +28,12 @@ function totalQty(jobId: string): number {
   const j = state.jobs.find((x) => x.id === jobId)
   return j ? j.parts.reduce((a, p) => a + p.qty, 0) : 0
 }
+function revTag(jobId: string): string | null {
+  const j = state.jobs.find((x) => x.id === jobId)
+  if (!j?.activeRevisionId) return null
+  const n = j.revisions?.find((r) => r.id === j.activeRevisionId)?.newRevNo
+  return n ? `第 ${n} 版` : null
+}
 
 function onCreate(): void {
   const job = createJob(newName.value)
@@ -153,6 +159,7 @@ function onFile(e: Event): void {
         <div class="row">
           <h3 style="font-size: 15px">{{ job.name }}</h3>
           <div class="spacer" />
+          <span v-if="revTag(job.id)" class="tag revtag">{{ revTag(job.id) }}</span>
           <span v-if="job.result" class="tag good">已排样</span>
           <span v-else class="tag">未排样</span>
         </div>
@@ -179,6 +186,7 @@ function onFile(e: Event): void {
         <div v-else style="height: 34px"></div>
         <div class="row">
           <router-link :to="`/parts/${job.id}`" class="btn-link">零件清单</router-link>
+          <router-link v-if="job.result" :to="`/revision/${job.id}`" class="btn-link">改版核定</router-link>
           <router-link :to="`/nest/${job.id}`" class="btn-link">排样</router-link>
           <router-link :to="`/stats/${job.id}`" class="btn-link">统计</router-link>
           <div class="spacer" />
@@ -250,5 +258,11 @@ function onFile(e: Event): void {
 .btn-link {
   font-size: 13px;
   padding: 4px 8px;
+}
+.revtag {
+  background: #f0faf8;
+  color: var(--c-accent);
+  border: 1px solid #9ad6c4;
+  font-weight: 700;
 }
 </style>

@@ -5,6 +5,7 @@ export const router = createRouter({
   routes: [
     { path: '/', name: 'home', component: () => import('./views/HomeView.vue') },
     { path: '/parts/:id', name: 'parts', component: () => import('./views/PartsView.vue') },
+    { path: '/revision/:id', name: 'revision', component: () => import('./views/RevisionView.vue') },
     { path: '/nest/:id', name: 'nest', component: () => import('./views/NestView.vue') },
     { path: '/cut/:id', name: 'cut', component: () => import('./views/CutView.vue') },
     { path: '/stats/:id', name: 'stats', component: () => import('./views/StatsView.vue') },

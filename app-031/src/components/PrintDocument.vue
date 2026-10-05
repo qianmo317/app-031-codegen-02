@@ -65,6 +65,9 @@ const boardByName = (name: string) =>
       >
         <h2>排样图 · 第 {{ s.index + 1 }} 张 / 共 {{ job.result?.sheets.length }} 张</h2>
         <p class="doc-meta">
+          <b v-if="s.reuseState === 'kept'" style="color:#15803d">【改版留用·整板照旧，勿重开】</b>
+          <b v-else-if="s.reuseState === 'mixed'" style="color:#92400e">【新旧混排·留用件标「留」勿重切，其余按本图回头切】</b>
+          <b v-else-if="s.reuseState === 'reopened'" style="color:#b91c1c">【受影响板·整板重开】</b>
           {{ s.boardName }}（{{ s.material }} {{ s.thicknessMm }}mm） · 尺寸
           {{ s.wMm }}×{{ s.hMm }}mm · 利用率 {{ (s.utilization * 100).toFixed(1) }}% ·
           锯路 {{ job.kerfMm }}mm · 修边 {{ job.trimMm }}mm
@@ -126,7 +129,12 @@ const boardByName = (name: string) =>
     <div v-if="sections.has('order')">
       <section class="print-page">
         <h2>下料单 / 领料单</h2>
-        <p class="doc-meta">项目：{{ job.name }} ｜ 打印时间：{{ now }}</p>
+        <p class="doc-meta">
+          项目：{{ job.name }} ｜ 版号：第 {{ printState.revNo }} 版<template v-if="printState.documentId"> ｜ 文号：{{ printState.documentId }}</template> ｜ 打印时间：{{ now }}
+        </p>
+        <p v-if="printState.documentId" class="doc-meta" style="border:1px solid #000; padding:3px 6px; display:inline-block">
+          车间凭此文号下料；改版后以「现行有效」文号为准，旧文号一律作废。
+        </p>
 
         <h3>一、板材领料</h3>
         <table class="pgrid">

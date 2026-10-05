@@ -1,13 +1,34 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob } from '../lib/store'
+import { getJob, activeRevisionReport, currentRevNo } from '../lib/store'
 import boardsData from '../data/boards.json'
 import { pct, money } from '../lib/format'
+import { REPORT_PRECISION } from '../lib/revision'
 
 const route = useRoute()
 const job = computed(() => getJob(route.params.id as string))
 const result = computed(() => job.value?.result)
+const revReport = computed(() => (job.value ? activeRevisionReport(job.value) : null))
+const revNo = computed(() => (job.value ? currentRevNo(job.value) : 0))
+
+const delta = computed(() => revReport.value?.deltaTotals)
+function signed(v: number, suffix = ''): string {
+  return `${v > 0 ? '+' : ''}${v}${suffix}`
+}
+function signedFixed(v: number, digits: number, suffix = ''): string {
+  return signed(Number(v.toFixed(digits)), suffix)
+}
+const deltaHardware = computed(() => {
+  const d = delta.value
+  if (!d) return []
+  return [
+    { name: boardsData.hardware.connectorName, value: signed(d.connectors, ' 套') },
+    { name: boardsData.hardware.dowelName, value: signed(d.dowels, ' 个') },
+    { name: boardsData.hardware.screwName, value: signed(d.screws, ' 颗') },
+    { name: boardsData.hardware.glueName, value: signed(+((d.glueGrams / 1000).toFixed(REPORT_PRECISION.glueKg)), ' kg') }
+  ]
+})
 
 const totalPieces = computed(
   () => result.value?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0
@@ -52,6 +73,45 @@ const utilMinMax = computed(() => {
 
 <template>
   <div v-if="job && result">
+    <!-- 改版差值（与明细页/工单页同源，不在此页另算两版） -->
+    <section v-if="revReport && delta" class="panel rev-delta">
+      <div class="row" style="margin-bottom: 8px">
+        <h3 style="font-size: 14px; margin: 0">第 {{ revNo }} 版改版差值（实际排样口径）</h3>
+        <span class="tag">逐项对账 {{ revReport.costReconcileOk ? '已对平 ✅' : '不平 ❌' }}</span>
+        <div class="spacer" />
+        <router-link class="small" :to="`/revision/${job.id}`">查看逐项成本表 →</router-link>
+      </div>
+      <div class="delta-grid">
+        <div class="d-box">
+          <b :class="delta.actualBoardsUsed > 0 ? 'up' : delta.actualBoardsUsed < 0 ? 'down' : ''">
+            {{ signed(delta.actualBoardsUsed, ' 张') }}
+          </b>
+          <span>用板：{{ revReport.oldTotals.actualBoardsUsed }} → {{ revReport.newTotals.actualBoardsUsed }}</span>
+        </div>
+        <div class="d-box">
+          <b :class="delta.actualCostCents > 0 ? 'up' : delta.actualCostCents < 0 ? 'down' : ''">
+            {{ signed(+(delta.actualCostCents / 100).toFixed(2), ' 元') }}
+          </b>
+          <span>板钱（实际）：{{ money(revReport.oldTotals.actualCostCents) }} → {{ money(revReport.newTotals.actualCostCents) }}</span>
+        </div>
+        <div class="d-box">
+          <b :class="delta.edgeMm > 0 ? 'up' : delta.edgeMm < 0 ? 'down' : ''">
+            {{ signedFixed(delta.edgeMm / 1000, REPORT_PRECISION.edgeM, ' m') }}
+          </b>
+          <span>封边：{{ (revReport.oldTotals.edgeMm / 1000).toFixed(2) }} → {{ (revReport.newTotals.edgeMm / 1000).toFixed(2) }} m</span>
+        </div>
+        <div class="d-box">
+          <b :class="delta.pieces > 0 ? 'up' : delta.pieces < 0 ? 'down' : ''">{{ signed(delta.pieces, ' 件') }}</b>
+          <span>零件总数</span>
+        </div>
+      </div>
+      <p class="small muted" style="margin: 8px 0 0">
+        折算毛口径（逐项可加）：用板 {{ signed(+delta.boardSheets.toFixed(REPORT_PRECISION.sheets), ' 张') }}、
+        板钱（到分）{{ signed(Math.round(delta.boardCostCents), ' 分') }}；
+        毛口径与实际口径的差为排样整数化/锯路损益，已在核定页对账列出。
+      </p>
+    </section>
+
     <!-- 师傅最关心的一句话 -->
     <section class="panel headline">
       <div class="hl-text">
@@ -119,11 +179,17 @@ const utilMinMax = computed(() => {
       <section class="panel">
         <h3>五金与胶量（按零件数估算）</h3>
         <table class="grid">
+          <thead>
+            <tr><th>辅料</th><th>本版用量</th><th v-if="revReport">改版差值</th></tr>
+          </thead>
           <tbody>
             <tr v-for="(h, i) in hardware" :key="i">
               <td>{{ h.name }}</td>
               <td style="text-align: right; font-variant-numeric: tabular-nums">
                 {{ h.value }} {{ h.unit }}
+              </td>
+              <td v-if="revReport" style="text-align: right" :class="deltaHardware[i]?.value.startsWith('+') || deltaHardware[i]?.value.startsWith('-') ? deltaHardware[i]?.value.startsWith('+') ? 'up' : 'down' : ''">
+                {{ deltaHardware[i]?.value }}
               </td>
             </tr>
           </tbody>
@@ -159,6 +225,43 @@ const utilMinMax = computed(() => {
 </template>
 
 <style scoped>
+.rev-delta {
+  margin-bottom: 14px;
+  background: linear-gradient(135deg, #f0faf8, #fff);
+  border-color: #9ad6c4;
+}
+.delta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 8px;
+}
+.d-box {
+  background: #fff;
+  border: 1px solid var(--c-line-soft);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.d-box b {
+  display: block;
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+.d-box b.up {
+  color: var(--c-bad);
+}
+.d-box b.down {
+  color: var(--c-accent);
+}
+.d-box span {
+  font-size: 11px;
+  color: var(--c-ink-2);
+}
+.up {
+  color: var(--c-bad);
+}
+.down {
+  color: var(--c-accent);
+}
 .headline {
   margin-bottom: 14px;
   background: linear-gradient(135deg, #fff7ed, #fff);

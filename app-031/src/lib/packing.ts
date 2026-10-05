@@ -13,8 +13,17 @@ import type {
   UnplacedInfo
 } from '../types'
 import { EPS, type Rect } from './geometry'
-import { buildSteps, simulate } from './cuts'
+import { buildSteps, simulate, rebuildFromPlacementsBudget } from './cuts'
 import type { DSeg } from './cuts'
+import type { CutStep } from '../types'
+
+/** 改版留用：旧版已摆好、要求冻结的一张板（placements 为要留用的零件）。 */
+export interface FrozenSheet {
+  board: Board
+  placements: Placement[]
+  oldSheetIndex: number
+  oldCutCount: number // 旧板内部刀数（用于统计回头切）
+}
 
 interface Inst {
   part: Part
@@ -27,6 +36,7 @@ interface FRect extends Rect {
   id: number
   parentRec: number | null // 由哪次放置产生（切割依赖）
   entrySeg: 'A' | 'B' | null // 进入该空档前必须完成的刀：首刀/次刀
+  frozen?: boolean // 改版留用旧板上回收的空档
 }
 
 interface Rec {
@@ -49,6 +59,10 @@ interface SheetState {
   free: FRect[]
   recs: Rec[]
   placements: Placement[]
+  frozen?: FrozenSheet
+  insertedCount: number // 留用板上新插入的件数（0 = 整板留用）
+  retainedCount: number // 留用旧件数
+  oldCutCount: number
 }
 
 function boardMatches(b: Board, p: Part): boolean {
@@ -58,10 +72,17 @@ function boardMatches(b: Board, p: Part): boolean {
     const target = boardDefs.get(p.boardId)
     return !!target && target.thicknessMm === b.thicknessMm
   }
+  // 改版留用：冻结的旧板 id 不在新版 boardDefs 里，按同厚度同材质兼容（板种未变的件才能留）
+  const frozen = frozenBoardIds.has(b.id)
+  if (frozen) {
+    const target = boardDefs.get(p.boardId)
+    return !!target && target.thicknessMm === b.thicknessMm && target.material === b.material
+  }
   return false
 }
 
 const boardDefs = new Map<string, Board>()
+const frozenBoardIds = new Set<string>()
 
 /** 统一为横向板（长边沿 x）。余料上台可以转，所以归一化安全。 */
 function normalize(b: Board): Board {
@@ -69,9 +90,14 @@ function normalize(b: Board): Board {
   return { ...b, wMm: b.hMm, hMm: b.wMm }
 }
 
-export function nestJob(job: Job): NestResult {
+export function nestJob(
+  job: Job,
+  frozenSheets: FrozenSheet[] = [],
+  extraSkipKeys: string[] = []
+): NestResult {
   const t0 = performance.now()
   boardDefs.clear()
+  frozenBoardIds.clear()
   const boards = job.boards.map(normalize)
   boards.forEach((b) => boardDefs.set(b.id, b))
   const kerf = job.kerfMm
@@ -121,11 +147,96 @@ export function nestJob(job: Job): NestResult {
         }
       ],
       recs: [],
-      placements: []
+      placements: [],
+      insertedCount: 0,
+      retainedCount: 0,
+      oldCutCount: 0
     }
     sheets.push(s)
     return s
   }
+
+  // —— 改版留用：先把旧板冻结上台，按 guillotine 二分口径从可用区里逐块「挖掉」
+  // 留用零件，把剩下的空档并入 free 池，供新版/改版件插入。冻结件不参与后续摆放循环。
+  const skipKeys = new Set<string>()
+  const openFrozenSheet = (f: FrozenSheet): SheetState | null => {
+    const b = normalize(f.board)
+    frozenBoardIds.add(b.id)
+    if (!boardDefs.has(b.id)) boardDefs.set(b.id, b)
+    const usable: Rect = {
+      x: trim,
+      y: trim,
+      w: Math.max(1, b.wMm - 2 * trim),
+      h: Math.max(1, b.hMm - 2 * trim)
+    }
+    const retained: Placement[] = f.placements.map((p) => ({ ...p, retained: true }))
+    // 越界/重叠校验：旧摆法必须本身合法
+    for (const p of retained) {
+      if (
+        p.x < trim - EPS ||
+        p.y < trim - EPS ||
+        p.x + p.lenMm > b.wMm - trim + EPS ||
+        p.y + p.widMm > b.hMm - trim + EPS
+      )
+        return null
+    }
+    for (let i = 0; i < retained.length; i++)
+      for (let j = i + 1; j < retained.length; j++) {
+        const a = retained[i]
+        const c = retained[j]
+        if (
+          a.x < c.x + c.lenMm - EPS &&
+          c.x < a.x + a.lenMm - EPS &&
+          a.y < c.y + c.widMm - EPS &&
+          c.y < a.y + a.widMm - EPS
+        )
+          return null
+      }
+    // 从可用区逐块减去留用矩形，按锯路剥出仍可下刀的空档（与排样器自身的二分余隙一致）
+    let free: FRect[] = [{ id: frSeq++, x: usable.x, y: usable.y, w: usable.w, h: usable.h, parentRec: null, entrySeg: null, frozen: true }]
+    const subtract = (cell: FRect, rx: number, ry: number, rw: number, rh: number): FRect[] => {
+      // 不相交：整块保留
+      if (rx >= cell.x + cell.w - EPS || rx + rw <= cell.x + EPS || ry >= cell.y + cell.h - EPS || ry + rh <= cell.y + EPS)
+        return [cell]
+      const out: FRect[] = []
+      // 相对可用区的左右余隙（≥kerf 才下得了刀，剥掉一条锯路）
+      const gxL = rx - cell.x
+      const gxR = cell.x + cell.w - (rx + rw)
+      if (gxL >= kerf - EPS) out.push({ id: frSeq++, x: cell.x, y: cell.y, w: gxL - kerf, h: cell.h, parentRec: null, entrySeg: null, frozen: true })
+      const innerX = gxL >= kerf - EPS ? rx : cell.x
+      const innerW = cell.w - (gxL >= kerf - EPS ? gxL : 0) - (gxR >= kerf - EPS ? gxR : 0)
+      if (gxR >= kerf - EPS) out.push({ id: frSeq++, x: rx + rw + kerf, y: cell.y, w: gxR - kerf, h: cell.h, parentRec: null, entrySeg: null, frozen: true })
+      const gyB = ry - cell.y
+      const gyT = cell.y + cell.h - (ry + rh)
+      if (gyB >= kerf - EPS) out.push({ id: frSeq++, x: innerX, y: cell.y, w: innerW, h: gyB - kerf, parentRec: null, entrySeg: null, frozen: true })
+      if (gyT >= kerf - EPS) out.push({ id: frSeq++, x: innerX, y: ry + rh + kerf, w: innerW, h: gyT - kerf, parentRec: null, entrySeg: null, frozen: true })
+      return out.filter((r) => r.w >= 1 && r.h >= 1)
+    }
+    for (const p of retained) {
+      const next: FRect[] = []
+      for (const cell of free) next.push(...subtract(cell, p.x, p.y, p.lenMm, p.widMm))
+      free = next
+    }
+    const s: SheetState = {
+      board: b,
+      index: sheets.length,
+      usable,
+      free,
+      recs: [],
+      placements: retained,
+      frozen: f,
+      insertedCount: 0,
+      retainedCount: retained.length,
+      oldCutCount: f.oldCutCount
+    }
+    retained.forEach((p) => skipKeys.add(p.instanceId))
+    sheets.push(s)
+    return s
+  }
+
+  for (const f of frozenSheets) openFrozenSheet(f)
+  // 留用件用新版实例号登记为「已摆放」，主摆放循环据此跳过，避免重复排
+  for (const k of extraSkipKeys) skipKeys.add(k)
 
   const canOpen = (b: Board): boolean => {
     // 余料板只有一块，用完即止；常规板库存是采购参考，可超开（稍后提示补采）
@@ -181,6 +292,7 @@ export function nestJob(job: Job): NestResult {
 
   let seq = 0
   for (const inst of sorted) {
+    if (skipKeys.has(inst.key)) continue // 该件已在旧板上冻结留用
     const p = inst.part
     let best:
       | { sheet: SheetState | null; fr: FRect | null; nb: Board | null; o: Orient; tier: number; waste: number }
@@ -314,6 +426,7 @@ export function nestJob(job: Job): NestResult {
     }
     s.recs.push(rec)
     seq++
+    if (s.frozen) s.insertedCount++
     s.placements.push({
       partId: p.id,
       instanceId: inst.key,
@@ -335,8 +448,17 @@ export function nestJob(job: Job): NestResult {
     })
   }
 
-  // 组装 SheetResult
-  const results: SheetResult[] = sheets.map((s) => buildSheet(s, kerf, trim))
+  // 组装 SheetResult（冻结板刀路重建可能受 DFS 预算影响失败）
+  const built = sheets.map((s) => buildSheet(s, kerf, trim))
+  if (frozenSheets.length > 0 && built.some((r) => r === null)) {
+    // 自愈：放弃整批留用，无冻结板重排一次（受影响旧板在 sheetPlan 中全部记为重开）
+    return nestJob(job, [])
+  }
+  const results = built.filter((r): r is SheetResult => r !== null)
+
+  // 全局重排 seq：留用件保留旧号会与新件撞号，按最终摆放顺序统一编号
+  let seqFinal = 0
+  for (const s of results) for (const p of s.placements) p.seq = ++seqFinal
 
   // 统计
   const boardsByType: Record<string, number> = {}
@@ -392,6 +514,21 @@ export function nestJob(job: Job): NestResult {
       ? stockUsed.reduce((a, s) => a + s.priceCents, 0) / stockUsed.length
       : job.boards.reduce((a, b) => a + b.priceCents, 0) / Math.max(1, job.boards.length)
 
+  let reuseStats: NestResult['reuseStats']
+  if (frozenSheets.length > 0) {
+    const kept = results.filter((s) => s.reuseState === 'kept').length
+    const mixed = results.filter((s) => s.reuseState === 'mixed').length
+    const reopened = results.filter((s) => s.reuseState === 'reopened').length
+    const newSheets = results.filter((s) => s.oldSheetIndex === undefined).length
+    const oldCutByIndex = new Map(frozenSheets.map((f) => [f.oldSheetIndex, f.oldCutCount]))
+    const backCuts = results.reduce((a, s) => {
+      if (s.oldSheetIndex === undefined) return a
+      const oldCuts = oldCutByIndex.get(s.oldSheetIndex) ?? 0
+      return a + Math.max(0, s.steps.filter((st) => st.kind === 'cut').length - oldCuts)
+    }, 0)
+    reuseStats = { strategy: 'reuse', keptSheets: kept, mixedSheets: mixed, reopenedSheets: reopened, newSheets, backCuts }
+  }
+
   return {
     sheets: results,
     boardsUsed: optimizedBoards,
@@ -407,7 +544,8 @@ export function nestJob(job: Job): NestResult {
     totalCostCents: totalCost,
     stockShortage,
     elapsedMs: Math.round(performance.now() - t0),
-    generatedAt: Date.now()
+    generatedAt: Date.now(),
+    ...(reuseStats ? { reuseStats } : {})
   }
 }
 
@@ -420,7 +558,73 @@ function segDepsOf(fr: FRect, s: SheetState): DSeg[] {
   return seg ? [seg] : []
 }
 
-function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult {
+/**
+ * 冻结板刀路重建：对「留用件 + 新插入件」全部就位矩形重新枚举 guillotine 分解。
+ * 留用件集合是旧版合法布局的子集（切去部分零件不会破坏 guillotine 性质），
+ * 加上新插入件来自本排样器的余隙二分，整体仍为 guillotine 可切；
+ * DFS 预算放大（旧单板零件可能较多），失败返回 null，由上层自愈。
+ */
+function buildFrozenSheet(s: SheetState, kerf: number, trim: number): SheetResult | null {
+  const b = s.board
+  const w = b.wMm
+  const h = b.hMm
+  const boardArea = w * h
+  const usedArea = s.placements.reduce((a, p) => a + p.origLen * p.origWid, 0)
+  let rebuilt: { steps: CutStep[]; leftovers: Rect[] } | null = null
+  for (const doMerge of [true, false]) {
+    rebuilt = rebuildFromPlacementsBudget(w, h, kerf, trim, s.index, s.placements, 6000, doMerge)
+    if (rebuilt) break
+  }
+  if (!rebuilt) return null
+  const steps = rebuilt.steps
+  const sim = simulate(w, h, kerf, steps, s.placements)
+  if (!sim.ok) return null
+  const offcuts: OffcutInfo[] = rebuilt.leftovers
+    .filter((r) => r.w >= 2 && r.h >= 2)
+    .map((r) => ({
+      x: Math.round(r.x),
+      y: Math.round(r.y),
+      wMm: Math.round(r.w),
+      hMm: Math.round(r.h),
+      areaMm2: Math.round(r.w * r.h),
+      usable: r.w >= 300 - EPS && r.h >= 300 - EPS
+    }))
+    .sort((a, c) => c.areaMm2 - a.areaMm2)
+  const state =
+    s.retainedCount > 0 && s.insertedCount > 0
+      ? 'mixed'
+      : s.retainedCount > 0
+        ? 'kept'
+        : 'reopened'
+  const internalNow = steps.filter((st) => st.kind === 'cut').length
+  return {
+    index: s.index,
+    boardId: b.id,
+    boardName: b.name,
+    material: b.material,
+    thicknessMm: b.thicknessMm,
+    wMm: w,
+    hMm: h,
+    priceCents: b.kind === 'offcut' ? 0 : b.priceCents,
+    placements: s.placements,
+    steps,
+    usedAreaMm2: usedArea,
+    boardAreaMm2: boardArea,
+    utilization: usedArea / boardArea,
+    offcuts,
+    reuseState: state,
+    reopenedReason:
+      state === 'mixed'
+        ? `新旧混排板：留用 ${s.retainedCount} 件、新插 ${s.insertedCount} 件，需单独挑出回头切 ${Math.max(0, internalNow - s.oldCutCount)} 刀`
+        : state === 'reopened'
+          ? '旧件全部改/删，整板重开'
+          : undefined,
+    oldSheetIndex: s.frozen?.oldSheetIndex
+  }
+}
+
+function buildSheet(s: SheetState, kerf: number, trim: number): SheetResult | null {
+  if (s.frozen) return buildFrozenSheet(s, kerf, trim)
   const raw: DSeg[] = []
   for (const r of s.recs) {
     if (r.segA) raw.push(r.segA)

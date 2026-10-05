@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   useStore,
@@ -11,6 +11,8 @@ import {
 } from '../lib/store'
 import { uid, parsePartText, parseEdges, money } from '../lib/format'
 import { toast } from '../lib/ui'
+import { activeRevisionReport, currentRevNo } from '../lib/store'
+import { kindLabel } from '../lib/revision'
 import type { Board, EdgeSide, Part } from '../types'
 
 const route = useRoute()
@@ -40,6 +42,39 @@ const totalPieces = computed(() => job.value?.parts.reduce((a, p) => a + (p.qty 
 const totalArea = computed(
   () => (job.value?.parts.reduce((a, p) => a + p.lenMm * p.widMm * p.qty, 0) ?? 0) / 1e6
 )
+
+// 改版核定（与工单页/统计页同源）：本页只按件号标出改动到了哪几件
+const revReport = computed(() => (job.value ? activeRevisionReport(job.value) : null))
+const revNo = computed(() => (job.value ? currentRevNo(job.value) : 0))
+function revOf(code: string): { kinds: string[]; reasons: string[] } | null {
+  const r = revReport.value?.byCode[code]
+  if (!r) return null
+  if (r.kinds.length === 1 && r.kinds[0] === 'unchanged') return null
+  return { kinds: r.kinds, reasons: r.reasons }
+}
+const affectedCount = computed(() => revReport.value?.affectedCodes.length ?? 0)
+const fingerprint = computed(() =>
+  JSON.stringify(job.value?.parts.map((p) => [p.code, p.lenMm, p.widMm, p.qty, p.grain, p.edgeBands.slice().sort().join('.'), p.boardId]))
+)
+const reportStale = ref(false)
+const lastFingerprint = ref('')
+function checkStale(): void {
+  // 改版应用后若又手工动过明细，报告与清单不再同源，提示回改版页重新核定
+  if (revReport.value) {
+    reportStale.value = fingerprint.value !== lastFingerprint.value
+  } else {
+    reportStale.value = false
+  }
+}
+watch(
+  revReport,
+  () => {
+    lastFingerprint.value = fingerprint.value
+    reportStale.value = false
+  },
+  { immediate: true }
+)
+watch(fingerprint, () => checkStale())
 
 const availableOffcuts = computed(() => state.offcuts.filter((o) => o.available))
 
@@ -202,6 +237,24 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
       </button>
     </div>
 
+    <!-- 改版状态条（与工单页/统计页同源） -->
+    <section v-if="revReport" class="panel rev-banner">
+      <div>
+        <b>第 {{ revNo }} 版改动已核到本清单</b>
+        <span class="muted small">
+          ：按件号认出 {{ affectedCount }} 件受影响（新增 {{ revReport.rows.filter((r) => r.kinds.includes('added')).length }} /
+          删除 {{ revReport.rows.filter((r) => r.kinds.includes('removed')).length }} /
+          改动 {{ revReport.rows.filter((r) => !r.kinds.includes('added') && !r.kinds.includes('removed') && !(r.kinds.length === 1 && r.kinds[0] === 'unchanged')).length }}）。
+          行底色标出这一改动到了哪几件；工单页与材料统计页看的是同一份核定结果。
+        </span>
+      </div>
+      <div class="spacer" />
+      <router-link class="sm btn-like" :to="`/revision/${job.id}`">查看改版核定 →</router-link>
+    </section>
+    <div v-if="reportStale" class="warn-box" style="margin-bottom: 12px">
+      ⚠️ 本清单在改版核定之后又被手工改动过，当前行上的改动标记已过期；请到「改版核定」页重新核定，避免明细页与工单页/统计页不同源。
+    </div>
+
     <!-- 参数与余料 -->
     <section class="panel" style="margin-bottom: 14px">
       <div class="row wrap" style="align-items: flex-end">
@@ -316,8 +369,19 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
             </tr>
           </thead>
           <tbody>
-            <tr v-for="p in job.parts" :key="p.id">
-              <td><input v-model="p.code" @change="save" /></td>
+            <tr v-for="p in job.parts" :key="p.id" :class="{ 'rev-affected': revOf(p.code), 'rev-added': revOf(p.code)?.kinds.includes('added') }">
+              <td>
+                <input v-model="p.code" @change="save" />
+                <span v-if="revOf(p.code)" class="rev-badges">
+                  <i
+                    v-for="k in revOf(p.code)!.kinds"
+                    :key="k"
+                    class="rb"
+                    :class="k"
+                    :title="revOf(p.code)!.reasons.join('；')"
+                  >{{ kindLabel(k as any) }}</i>
+                </span>
+              </td>
               <td><input v-model="p.name" @change="save" /></td>
               <td><input v-model.number="p.lenMm" type="number" min="1" @change="save" /></td>
               <td><input v-model.number="p.widMm" type="number" min="1" @change="save" /></td>
@@ -365,6 +429,59 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
 </template>
 
 <style scoped>
+.rev-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  background: #f0faf8;
+  border-color: #9ad6c4;
+}
+.btn-like {
+  border: 1px solid var(--c-line);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+tr.rev-affected {
+  background: #fffdf2;
+}
+tr.rev-added {
+  background: #f4fdf6;
+}
+.rev-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-top: 2px;
+}
+.rb {
+  font-style: normal;
+  font-size: 9px;
+  border-radius: 3px;
+  padding: 0 4px;
+  border: 1px solid var(--c-line);
+  background: #f4f7f3;
+  line-height: 14px;
+}
+.rb.added {
+  background: #dcfce7;
+  border-color: #86efac;
+}
+.rb.removed {
+  background: #fee2e2;
+  border-color: #fca5a5;
+}
+.rb.size,
+.rb.qty,
+.rb.grain,
+.rb.edge,
+.rb.board {
+  background: #fef9c3;
+  border-color: #fde047;
+}
 .offcut-chip {
   display: inline-flex;
   align-items: center;

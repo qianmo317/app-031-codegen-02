@@ -1,10 +1,24 @@
 // 全局状态：Vue reactive 单例 + localStorage 持久化（无 Pinia/Vuex）
 import { reactive, computed } from 'vue'
-import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from '../types'
-import { nestJob } from './packing'
+import type {
+  Board,
+  Job,
+  NestResult,
+  Part,
+  Placement,
+  RegisteredOffcut,
+  SheetResult,
+  RevisionRecord,
+  RevisionReport,
+  RevisionSnapshot,
+  RevisionStrategy,
+  ExportRecord
+} from '../types'
+import { nestJob, type FrozenSheet } from './packing'
 import { rebuildFromPlacements } from './cuts'
 import { guillotineViolation } from './geometry'
-import { uid } from './format'
+import { buildRevisionReport, partToLoose } from './revision'
+import { uid, parseEdges } from './format'
 import boardsData from '../data/boards.json'
 
 const JOBS_KEY = 'fco.jobs.v1'
@@ -155,6 +169,292 @@ export function runNest(job: Job): NestResult {
   persist()
   return result
 }
+
+// ───────────────────────── 改版影响核定（中途改图） ─────────────────────────
+
+export function currentRevNo(job: Job): number {
+  const id = job.activeRevisionId
+  if (!id) return 0
+  const rec = job.revisions?.find((r) => r.id === id)
+  return rec ? rec.newRevNo : 0
+}
+
+/** 当前生效的改版核定报告（明细页/工单页/统计页同源读取，杜绝三处各算一遍）。 */
+export function activeRevisionReport(job: Job): RevisionReport | null {
+  if (!job.activeRevisionId || !job.revisions) return null
+  const rec = job.revisions.find((r) => r.id === job.activeRevisionId && r.applied)
+  return rec?.report ?? null
+}
+
+export function pendingRevisionReport(job: Job): RevisionReport | null {
+  const rec = job.revisions?.find((r) => !r.applied && !r.rolledBack)
+  return rec?.report ?? null
+}
+
+interface DraftRevisionInput {
+  newParts: Part[]
+  strategy: RevisionStrategy
+  label: string
+  boards?: Board[] // 一般沿用本单板材库；留空取 job.boards
+}
+
+interface DraftRevisionResult {
+  record: RevisionRecord
+  previewResult: NestResult
+}
+
+/**
+ * 试算一版改版（不落库）：把旧版整版快照 + 新旧对比报告 + 按所选策略的预排结果
+ * 一次性算齐。三个页面以后只读本对象。
+ */
+export function draftRevision(job: Job, input: DraftRevisionInput): DraftRevisionResult | null {
+  const strategy = input.strategy
+  const boards = input.boards ?? job.boards
+  const baseRevNo = currentRevNo(job)
+  const oldParts = JSON.parse(JSON.stringify(job.parts)) as Part[]
+  const newParts = JSON.parse(JSON.stringify(input.newParts)) as Part[]
+  const oldResult = job.result ? (JSON.parse(JSON.stringify(job.result)) as NestResult) : undefined
+
+  // 板种 id 在新版 parts 里仍引用 job.boards 的 id；两版结构靠 report 内 boardKey（名+厚度）对齐
+  const oldLoose = oldParts.map(partToLoose)
+  const newLoose = newParts.map(partToLoose)
+
+  let previewResult: NestResult
+  if (strategy === 'reuse' && oldResult) {
+    const { sheets: frozen, skipKeys } = buildFrozenSheets(oldParts, newParts, oldResult, boards)
+    previewResult = nestJob({ ...job, boards, parts: newParts }, frozen, skipKeys)
+  } else {
+    previewResult = nestJob({ ...job, boards, parts: newParts })
+  }
+
+  const report = buildRevisionReport({
+    oldLoose,
+    newLoose,
+    boards,
+    strategy,
+    oldResult,
+    newResult: previewResult
+  })
+
+  const oldSnapshot: RevisionSnapshot = {
+    revNo: baseRevNo,
+    label: baseRevNo === 0 ? '原始版' : `第 ${baseRevNo} 版`,
+    appliedAt: job.revisions?.find((r) => r.id === job.activeRevisionId)?.appliedAt ?? job.createdAt,
+    strategy: job.revisions?.find((r) => r.id === job.activeRevisionId)?.strategy ?? 'rerun',
+    parts: oldParts,
+    result: oldResult
+  }
+
+  const record: RevisionRecord = {
+    id: uid('rev'),
+    createdAt: Date.now(),
+    strategy,
+    baseRevNo,
+    newRevNo: baseRevNo + 1,
+    label: input.label.trim() || `第 ${baseRevNo + 1} 版`,
+    report,
+    oldSnapshot,
+    applied: false
+  }
+  return { record, previewResult }
+}
+
+/**
+ * 由旧排样结果构造冻结板：只保留「件号两版相同 且 长宽/纹理 未变 且 板种结构兼容
+ * （厚度+材质；粘贴来的新版不带板 id，按自动选板落到同结构板）且数量内」的件，
+ * 其余件从旧板撤出（该板要么 reopened 要么 mixed）。放置坐标/朝向原样保留。
+ * 新 part 对象有新 id，需要把旧 placement 的 partId/instanceId 重写到新 part，
+ * 才能让排样器的 skipKeys 与最终标签一致。
+ */
+function buildFrozenSheets(
+  oldParts: Part[],
+  newParts: Part[],
+  oldResult: NestResult,
+  boards: Board[]
+): { sheets: FrozenSheet[]; skipKeys: string[] } {
+  const oldByCode = new Map<string, Part>()
+  for (const p of oldParts) oldByCode.set(p.code, p)
+  const newByCode = new Map<string, Part>()
+  for (const p of newParts) newByCode.set(p.code, p)
+  const boardById = new Map(boards.map((b) => [b.id, b]))
+  // 件的「板种结构」：指定板取该板，否则自动选最小板（与 revision 核算的自动选板同口径）
+  const structureOf = (p: Part): string => {
+    const direct = p.boardId ? boardById.get(p.boardId) : undefined
+    if (direct) return `${direct.thicknessMm}/${direct.material}`
+    const auto = [...boards].sort((a, b) => a.wMm * a.hMm - b.wMm * b.hMm)[0]
+    return auto ? `${auto.thicknessMm}/${auto.material}` : ''
+  }
+
+  const geomSame = (a: Part, b: Part): boolean =>
+    a.lenMm === b.lenMm && a.widMm === b.widMm && a.grain === b.grain && structureOf(a) === structureOf(b)
+
+  const out: FrozenSheet[] = []
+  const newInstanceKeys: string[] = []
+  const globalUsed = new Map<string, number>() // 件号在所有旧板上已保留到第几件（跨板连续编号）
+  oldResult.sheets.forEach((sheet, oldSheetIndex) => {
+    const kept: Placement[] = []
+    for (const pl of sheet.placements) {
+      const oldP = oldByCode.get(pl.code)
+      const newP = newByCode.get(pl.code)
+      if (!oldP || !newP || !geomSame(oldP, newP)) continue
+      const used = globalUsed.get(pl.code) ?? 0
+      if (used >= newP.qty) continue // 数量减少：多余的件不留
+      globalUsed.set(pl.code, used + 1)
+      // 留用件用新版实例号（标签/选择器与新版 parts 对齐），同件号跨旧板连续编号，
+      // 并登记为「已摆放」，排样器展开新版实例时跳过，不会在新板上重复排。
+      const newInstanceKey = `${newP.id}#${used + 1}`
+      newInstanceKeys.push(newInstanceKey)
+      kept.push({
+        ...pl,
+        partId: newP.id,
+        instanceId: newInstanceKey,
+        boardIndex: oldSheetIndex,
+        retained: true
+      })
+    }
+    if (kept.length === 0) return // 整板撤空：不冻结，走 reopened/新开
+    out.push({
+      board: {
+        id: `frozen_${oldSheetIndex}_${uid('b')}`,
+        name: sheet.boardName,
+        wMm: sheet.wMm,
+        hMm: sheet.hMm,
+        thicknessMm: sheet.thicknessMm,
+        material: sheet.material,
+        priceCents: sheet.priceCents,
+        quantity: 1,
+        kind: 'stock'
+      },
+      placements: kept,
+      oldSheetIndex,
+      oldCutCount: sheet.steps.filter((s) => s.kind === 'cut').length
+    })
+  })
+  return { sheets: out, skipKeys: newInstanceKeys }
+}
+
+/** 应用改版：旧版整版入档（含当时用板/封边原数，永不被覆盖），清单与排样切到新版。 */
+export function applyRevision(
+  job: Job,
+  record: RevisionRecord,
+  previewResult: NestResult,
+  newParts: Part[]
+): void {
+  // 存根（_newParts 仅供同会话再回退使用；持久化以 job.parts/result 为准）
+  ;(record as RevisionRecord & { _newParts?: Part[] })._newParts = JSON.parse(
+    JSON.stringify(newParts)
+  )
+
+  // 作废台账：本改版前导出/下发过的清单全部标记作废，等待重发
+  voidPendingExports(job, record)
+
+  record.applied = true
+  record.appliedAt = Date.now()
+  if (!job.revisions) job.revisions = []
+  const idx = job.revisions.findIndex((r) => r.id === record.id)
+  if (idx >= 0) job.revisions.splice(idx, 1)
+  job.revisions.unshift(record)
+  job.activeRevisionId = record.id
+  job.parts = JSON.parse(JSON.stringify(newParts))
+  job.result = previewResult
+  persist()
+}
+
+/**
+ * 回退到旧版（走错的那条路：存档旧结果与已发清单作废，回退重发）。
+ * 回退目标 = 该次改版的旧版（oldSnapshot）；旧版那组数（用板/封边）原样恢复，不重算。
+ */
+export function rollbackRevision(job: Job, revisionId: string, reason: string): void {
+  const rec = job.revisions?.find((r) => r.id === revisionId)
+  if (!rec || !rec.applied) return
+  rec.rolledBack = true
+  rec.rolledBackAt = Date.now()
+  // 该版导出的清单全部作废
+  for (const ex of job.exports ?? []) {
+    if (ex.revNo === rec.newRevNo && !ex.voided) {
+      ex.voided = true
+      ex.voidedAt = Date.now()
+      ex.voidReason = `改版回退：${reason}`
+    }
+  }
+  // 恢复到「旧版自己」的零件与排样（不是它的再上一版）
+  const targetParts = JSON.parse(JSON.stringify(rec.oldSnapshot.parts)) as Part[]
+  const targetResult = rec.oldSnapshot.result
+    ? (JSON.parse(JSON.stringify(rec.oldSnapshot.result)) as NestResult)
+    : undefined
+  // 若旧版也是一次改版应用后的状态，其零件即等于那次改版应用时的 newParts
+  const earlier = (job.revisions ?? [])
+    .filter((r) => r.applied && !r.rolledBack && r.newRevNo === rec.baseRevNo)
+    .sort((a, b) => b.newRevNo - a.newRevNo)[0]
+  const restoreParts = earlier
+    ? JSON.parse(
+        JSON.stringify((earlier as RevisionRecord & { _newParts?: Part[] })._newParts ?? targetParts)
+      ) as Part[]
+    : targetParts
+  job.parts = restoreParts
+  job.result = targetResult
+  job.activeRevisionId = earlier?.id
+  persist()
+}
+
+/** 翻回旧版查看（只读，不动当前清单）：返回旧版快照。 */
+export function viewOldSnapshot(job: Job, revisionId: string): RevisionSnapshot | null {
+  const rec = job.revisions?.find((r) => r.id === revisionId)
+  return rec?.oldSnapshot ?? null
+}
+
+/** 导出/下发记账：登记一次清单导出，带文号与当时版号。 */
+export function recordExport(job: Job, sections: string[], documentId?: string): ExportRecord {
+  const doc: ExportRecord = {
+    id: uid('doc'),
+    at: Date.now(),
+    sections,
+    revNo: currentRevNo(job),
+    documentId: documentId ?? `XL-${job.id.slice(-4)}-R${currentRevNo(job)}-${Date.now().toString(36).slice(-4)}`.toUpperCase(),
+    voided: false
+  }
+  if (!job.exports) job.exports = []
+  job.exports.unshift(doc)
+  persist()
+  return doc
+}
+
+/** 重发：把指定旧清单作废，登记一份新文号清单（两号互相挂接）。 */
+export function reissueExport(
+  job: Job,
+  oldDocId: string,
+  sections: string[]
+): { oldDoc: ExportRecord; newDoc: ExportRecord } | null {
+  const oldDoc = job.exports?.find((e) => e.id === oldDocId)
+  if (!oldDoc) return null
+  const newDoc = recordExport(job, sections)
+  oldDoc.voided = true
+  oldDoc.voidedAt = Date.now()
+  oldDoc.voidReason = '改版后重发，旧清单作废'
+  oldDoc.supersededBy = newDoc.documentId
+  newDoc.replacedDocId = oldDoc.documentId
+  persist()
+  return { oldDoc, newDoc }
+}
+
+function voidPendingExports(job: Job, record: RevisionRecord): void {
+  const oldRevNo = record.baseRevNo
+  for (const ex of job.exports ?? []) {
+    if (ex.revNo <= oldRevNo && !ex.voided) {
+      ex.voided = true
+      ex.voidedAt = Date.now()
+      ex.voidReason = `第 ${record.newRevNo} 版改图：旧版清单停止使用，请按重发清单下料`
+    }
+  }
+}
+
+export function activeExports(job: Job): ExportRecord[] {
+  return (job.exports ?? []).filter((e) => !e.voided)
+}
+export function voidedExports(job: Job): ExportRecord[] {
+  return (job.exports ?? []).filter((e) => e.voided)
+}
+
 
 /** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */
 export function applyAdjustment(
@@ -354,6 +654,41 @@ export function newPart(partial: Partial<Part> = {}): Part {
     exposed: partial.exposed ?? false,
     boardId: partial.boardId ?? ''
   }
+}
+
+/**
+ * 改版粘贴导入：新版零件暂不指定板种（boardId 空=自动），
+ * 若两版自动选板一致，「板材变」一栏不误报；用户也可在应用后到明细页指定。
+ * 返回全新 part（新 id），不影响当前清单，直到用户确认应用。
+ */
+export function buildRevisionParts(
+  _job: Job,
+  rows: {
+    code: string
+    name: string
+    lenMm: number
+    widMm: number
+    qty: number
+    grain: string
+    edges: string
+    cabinet: string
+    exposed: boolean
+  }[]
+): Part[] {
+  return rows.map((r) =>
+    newPart({
+      code: r.code,
+      name: r.name,
+      lenMm: r.lenMm,
+      widMm: r.widMm,
+      qty: r.qty,
+      grain: r.grain as Part['grain'],
+      edgeBands: parseEdges(r.edges),
+      cabinet: r.cabinet,
+      exposed: r.exposed,
+      boardId: ''
+    })
+  )
 }
 
 export function exportJobJson(job: Job): string {
