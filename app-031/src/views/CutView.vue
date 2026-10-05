@@ -23,6 +23,28 @@ const partCount = computed(
   () => result.value?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0
 )
 
+// 改版留用：工单页据同一份 job.revision 决定哪几单重开
+const revision = computed(() => job.value?.revision)
+const reopenSet = computed(() => {
+  const r = revision.value
+  if (!r || r.status !== 'applied') return new Set<number>()
+  if (r.strategy === 'renest') return new Set<number>(result.value?.sheets.map((s) => s.index) ?? [])
+  return new Set(result.value?.sheets.filter((s) => s.provenance === 'reopen').map((s) => s.index) ?? [])
+})
+const keptCount = computed(
+  () => result.value?.sheets.filter((s) => s.provenance === 'kept').length ?? 0
+)
+const mixedCount = computed(
+  () => result.value?.sheets.filter((s) => s.provenance === 'mixed').length ?? 0
+)
+const reopenCount = computed(() => reopenSet.value.size)
+function sheetTag(index: number): '' | 'kept' | 'mixed' | 'reopen' {
+  return result.value?.sheets.find((s) => s.index === index)?.provenance ?? ''
+}
+const voidCountOnSheet = computed(
+  () => sheet.value?.placements.filter((p) => p.void).length ?? 0
+)
+
 const currentStep = computed(() =>
   cur.value >= 0 && sheet.value ? sheet.value.steps[cur.value] : null
 )
@@ -76,10 +98,24 @@ function printCut(): void {
 
 <template>
   <div v-if="job && result && sheet">
+    <!-- 改版工单同源提示：哪几单重开、哪几单留用 -->
+    <section v-if="revision?.status === 'applied'" class="panel rev-order-bar">
+      <div class="row wrap">
+        <b>改版工单（第 {{ job.versionNo }} 版，与明细页/统计页同源）：</b>
+        <span class="tag good">留用不重开 {{ keptCount }} 张</span>
+        <span class="tag warn">混排照旧切 {{ mixedCount }} 张（回头切）</span>
+        <span class="tag bad">必须重开 {{ reopenCount }} 张</span>
+        <div class="spacer" />
+        <router-link class="sm btn-like" :to="`/revision/${job.id}`">回改版核定 →</router-link>
+      </div>
+    </section>
+
     <section class="panel ctrl-bar">
-      <select v-model.number="activeSheet" style="width: 220px">
+      <select v-model.number="activeSheet" style="width: 280px">
         <option v-for="s in result.sheets" :key="s.index" :value="s.index">
-          第 {{ s.index + 1 }} 张 · {{ s.boardName }}（{{ s.steps.length }} 刀）
+          第 {{ s.index + 1 }} 张 · {{ s.boardName }}（{{ s.steps.length }} 刀）{{
+            s.provenance === 'reopen' ? ' · 重开新单' : s.provenance === 'mixed' ? ' · 混排照旧切' : s.provenance === 'kept' ? ' · 旧单留用' : ''
+          }}
         </option>
       </select>
       <button class="sm" @click="reset">⏮ 复位</button>
@@ -98,6 +134,18 @@ function printCut(): void {
 
     <div class="cut-layout">
       <section class="panel">
+        <div v-if="sheetTag(sheet.index)" class="row" style="margin-bottom: 8px">
+          <span :class="['sheet-state', sheetTag(sheet.index)]">
+            {{ sheetTag(sheet.index) === 'reopen'
+              ? '🔴 重开新单：本张为改版后重排'
+              : sheetTag(sheet.index) === 'mixed'
+                ? '🟡 混排旧板照旧切：未受影响件按旧刀路回头切，标废件勿切'
+                : '🟢 旧单留用：摆法与刀路不变' }}
+          </span>
+        </div>
+        <div v-if="voidCountOnSheet > 0" class="void-warn">
+          ⚠️ 本板有 {{ voidCountOnSheet }} 件改版标废（图中红叉/斜线），照旧刀路切时跳过这些件；其用量已由重开新单补。
+        </div>
         <div class="cut-headline" :class="{ trim: currentStep?.kind === 'trim' }">
           <template v-if="currentStep">
             <b>
@@ -146,6 +194,40 @@ function printCut(): void {
 </template>
 
 <style scoped>
+.rev-order-bar {
+  margin-bottom: 10px;
+  border-color: #bfe3cc;
+  background: var(--c-good-bg);
+}
+.btn-like {
+  border: 1px solid var(--c-line);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  text-decoration: none;
+}
+.sheet-state {
+  font-size: 13px;
+  font-weight: 600;
+}
+.sheet-state.reopen {
+  color: var(--c-bad);
+}
+.sheet-state.mixed {
+  color: var(--c-warn);
+}
+.sheet-state.kept {
+  color: var(--c-good);
+}
+.void-warn {
+  border: 1px solid #eecfcf;
+  background: var(--c-bad-bg);
+  color: var(--c-bad);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 12px;
+  margin-bottom: 10px;
+}
 .ctrl-bar {
   display: flex;
   gap: 8px;

@@ -5,18 +5,42 @@ import {
   useStore,
   getJob,
   saveJob,
-  runNest,
+  rerunNest,
   newPart,
-  allStockTemplates
+  allStockTemplates,
+  clearRevision
 } from '../lib/store'
 import { uid, parsePartText, parseEdges, money } from '../lib/format'
+import { revisionSignature } from '../lib/revision'
 import { toast } from '../lib/ui'
-import type { Board, EdgeSide, Part } from '../types'
+import type { Board, EdgeSide, Part, RevRow } from '../types'
 
 const route = useRoute()
 const router = useRouter()
 const { state } = useStore()
 const job = computed(() => getJob(route.params.id as string))
+const revision = computed(() => job.value?.revision)
+const revStale = computed(() => {
+  const j = job.value
+  const r = revision.value
+  if (!j || !r || r.status !== 'draft') return false
+  return revisionSignature(j.parts, j.kerfMm, j.trimMm) !== r.signature
+})
+/** 明细页按件号查这一改到了哪几件（与工单页/统计页同一份 job.revision）。 */
+const revRowByCode = computed(() => {
+  const m = new Map<string, RevRow>()
+  if (revision.value) for (const r of revision.value.rows) m.set(r.code, r)
+  return m
+})
+const revKindText: Record<RevRow['kind'], string> = {
+  added: '新增',
+  removed: '删除',
+  changed: '修改',
+  same: ''
+}
+function revBadge(code: string): RevRow | undefined {
+  return revRowByCode.value.get(code)
+}
 
 const importOpen = ref(false)
 const importText = ref('')
@@ -45,6 +69,14 @@ const availableOffcuts = computed(() => state.offcuts.filter((o) => o.available)
 
 function save(): void {
   if (job.value) saveJob(job.value)
+}
+
+function dismissRevision(): void {
+  if (!job.value?.revision) return
+  if (window.confirm('放弃改版核定？旧版清单与排样保持不变。')) {
+    clearRevision(job.value)
+    toast('改版核定已作废，旧版保持不变')
+  }
 }
 
 function addBoard(): void {
@@ -174,7 +206,7 @@ async function doNest(): Promise<void> {
   }
   running.value = true
   try {
-    const r = runNest(j)
+    const r = rerunNest(j)
     if (r.unplaced.length > 0) {
       toast(`${r.unplaced.length} 种零件未排下，请看排样页提示`, 'bad', 4200)
     } else {
@@ -201,6 +233,36 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
         {{ running ? '排样计算中…' : '开始排样 →' }}
       </button>
     </div>
+
+    <!-- 改版核定同源横幅 -->
+    <section v-if="revision" class="rev-banner" :class="revision.status">
+      <div class="row wrap">
+        <span :class="['rev-dot', revision.status]"></span>
+        <b v-if="revision.status === 'draft'">改版核定草稿（尚未应用，下表仍为旧版）</b>
+        <b v-else>已应用改版：当前为第 {{ job!.versionNo ?? 2 }} 版</b>
+        <span class="tag">
+          排样实算用板 {{ revision.totals.dSheetsExact > 0 ? '+' : '' }}{{ revision.totals.dSheetsExact }} 张 ·
+          料钱 {{ revision.totals.dBoardCentsExact > 0 ? '+' : '' }}{{ money(revision.totals.dBoardCentsExact) }} ·
+          封边 {{ revision.totals.dEdgeM > 0 ? '+' : '' }}{{ revision.totals.dEdgeM }}m ·
+          件数 {{ revision.totals.dPieces > 0 ? '+' : '' }}{{ revision.totals.dPieces }}
+        </span>
+        <span v-if="revision.status === 'draft'" class="tag warn">
+          新增 {{ revision.rows.filter((r) => r.kind === 'added').length }} /
+          删除 {{ revision.rows.filter((r) => r.kind === 'removed').length }} /
+          修改 {{ revision.rows.filter((r) => r.kind === 'changed').length }}
+        </span>
+        <div class="spacer" />
+        <router-link class="sm btn-like" :to="`/revision/${job!.id}`">打开改版核定 →</router-link>
+        <button v-if="revision.status === 'draft'" class="sm" @click="dismissRevision">放弃核定</button>
+      </div>
+      <p v-if="revStale" class="small" style="color: var(--c-bad); margin: 6px 0 0">
+        ⚠️ 清单在核定后又被改动，核定已过期。请回改版页重新核定，否则明细/工单/统计三处会对不上。
+      </p>
+      <p v-else-if="revision.status === 'draft'" class="small muted" style="margin: 6px 0 0">
+        下表行内标记：新增件不在旧表（见核定页），<b>删除</b>件整行标红，<b>修改</b>件在对应字段后标出旧值。
+        核定应用前在此编辑旧版会使核定过期。
+      </p>
+    </section>
 
     <!-- 参数与余料 -->
     <section class="panel" style="margin-bottom: 14px">
@@ -316,8 +378,21 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
             </tr>
           </thead>
           <tbody>
-            <tr v-for="p in job.parts" :key="p.id">
-              <td><input v-model="p.code" @change="save" /></td>
+            <tr
+              v-for="p in job.parts"
+              :key="p.id"
+              :class="{
+                'rev-removed': revBadge(p.code)?.kind === 'removed' && revision?.status === 'draft',
+                'rev-changed': revBadge(p.code)?.kind === 'changed' || revBadge(p.code)?.kind === 'added'
+              }"
+            >
+              <td>
+                <input v-model="p.code" @change="save" />
+                <span
+                  v-if="revBadge(p.code) && revBadge(p.code)!.kind !== 'same'"
+                  :class="['rev-pill', revBadge(p.code)!.kind]"
+                >{{ revKindText[revBadge(p.code)!.kind] }}</span>
+              </td>
               <td><input v-model="p.name" @change="save" /></td>
               <td><input v-model.number="p.lenMm" type="number" min="1" @change="save" /></td>
               <td><input v-model.number="p.widMm" type="number" min="1" @change="save" /></td>
@@ -350,6 +425,35 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <!-- 改版：旧版表里没有的新增件 & 本表将被删掉的件（同源读 revision） -->
+      <div v-if="revision" class="rev-summary">
+        <div v-if="revision.rows.filter((r) => r.kind === 'added').length > 0" class="rev-add-box">
+          <b class="small">新版新增件号（旧表没有，应用后进表）：</b>
+          <span
+            v-for="r in revision.rows.filter((x) => x.kind === 'added')"
+            :key="r.code"
+            class="tag good"
+            style="margin: 2px 4px 2px 0"
+          >{{ r.code }} ×{{ r.now.qty ?? 1 }}</span>
+        </div>
+        <div v-if="revision.status === 'draft' && revision.rows.filter((r) => r.kind === 'removed').length > 0" class="rev-del-box">
+          <b class="small">拟删件号（旧表标红行，应用后出表）：</b>
+          <span
+            v-for="r in revision.rows.filter((x) => x.kind === 'removed')"
+            :key="r.code"
+            class="tag bad"
+            style="margin: 2px 4px 2px 0"
+          >{{ r.code }} ×{{ r.old.qty ?? 1 }}</span>
+        </div>
+        <div class="small muted" style="margin-top: 6px">
+          纹理变化的件：
+          <span v-for="r in revision.rows.filter((x) => x.fields.includes('grain'))" :key="'g' + r.code" class="tag warn" style="margin: 2px 4px 2px 0">
+            {{ r.code }} {{ r.changes.find((c) => c.field === 'grain')?.old }}→{{ r.changes.find((c) => c.field === 'grain')?.now }}
+          </span>
+          <span v-if="revision.rows.filter((x) => x.fields.includes('grain')).length === 0">无</span>
+        </div>
       </div>
     </section>
 
@@ -454,5 +558,72 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
 }
 .sticky-bar a {
   color: #9fb0a7;
+}
+.rev-banner {
+  border: 1px solid #bfe3cc;
+  background: var(--c-good-bg);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+.rev-banner.draft {
+  border-color: #f0d9b5;
+  background: #fffbeb;
+}
+.rev-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--c-good);
+  display: inline-block;
+}
+.rev-dot.draft {
+  background: var(--c-warn);
+}
+.btn-like {
+  border: 1px solid var(--c-line);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  text-decoration: none;
+}
+.rev-pill {
+  display: inline-block;
+  margin-top: 2px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  border: 1px solid;
+}
+.rev-pill.added {
+  color: var(--c-good);
+  border-color: #bfe3cc;
+  background: var(--c-good-bg);
+}
+.rev-pill.removed {
+  color: var(--c-bad);
+  border-color: #eecfcf;
+  background: var(--c-bad-bg);
+}
+.rev-pill.changed {
+  color: var(--c-warn);
+  border-color: #f0d9b5;
+  background: #fffbeb;
+}
+tr.rev-removed {
+  background: var(--c-bad-bg) !important;
+}
+tr.rev-removed input {
+  text-decoration: line-through;
+  color: var(--c-bad);
+}
+.rev-summary {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--c-line);
+}
+.rev-add-box,
+.rev-del-box {
+  margin: 4px 0;
 }
 </style>

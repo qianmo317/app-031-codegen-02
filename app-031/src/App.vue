@@ -9,6 +9,7 @@ const { toasts } = useToasts()
 const jobId = computed(() => (route.params.id as string) || null)
 const tabs = [
   { to: 'parts', label: '零件清单' },
+  { to: 'revision', label: '改版核定' },
   { to: 'nest', label: '排样结果' },
   { to: 'cut', label: '裁切步骤' },
   { to: 'stats', label: '材料统计' },

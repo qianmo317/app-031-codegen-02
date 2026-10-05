@@ -178,15 +178,36 @@ function partCursor(): string {
         :y="dragId === p.instanceId && ghost ? ghost.y : p.y"
         :width="p.lenMm"
         :height="p.widMm"
-        :fill="cabinetFill(p.cabinet)"
-        :stroke="cabinetStroke(p.cabinet)"
-        :stroke-width="selectedId === p.instanceId ? 3 : 1.4"
+        :fill="p.void ? '#d8d8d8' : cabinetFill(p.cabinet)"
+        :stroke="p.void ? '#b91c1c' : cabinetStroke(p.cabinet)"
+        :stroke-width="selectedId === p.instanceId ? 3 : p.void ? 2.2 : 1.4"
+        :stroke-dasharray="p.void ? '10 6' : undefined"
+        :opacity="p.void ? 0.85 : 1"
         :style="{ cursor: partCursor() }"
         @pointerdown="onDown($event, p.instanceId)"
         @click="emit('select', p.instanceId)"
       />
+      <!-- 改版标废件：红叉 + 斜线，照旧刀路切时跳过 -->
+      <g v-if="p.void" class="void-mark" pointer-events="none">
+        <line
+          :x1="p.x" :y1="p.y" :x2="p.x + p.lenMm" :y2="p.y + p.widMm"
+          stroke="#b91c1c" stroke-width="3"
+        />
+        <line
+          :x1="p.x + p.lenMm" :y1="p.y" :x2="p.x" :y2="p.y + p.widMm"
+          stroke="#b91c1c" stroke-width="3"
+        />
+        <rect
+          :x="p.x + p.lenMm / 2 - 26" :y="p.y + p.widMm / 2 - 17"
+          width="52" height="34" rx="4" fill="#b91c1c"
+        />
+        <text
+          :x="p.x + p.lenMm / 2" :y="p.y + p.widMm / 2 + 7"
+          text-anchor="middle" class="void-text" font-size="26"
+        >废</text>
+      </g>
       <text
-        v-if="dragId !== p.instanceId"
+        v-if="dragId !== p.instanceId && !p.void"
         :x="p.x + p.lenMm / 2"
         :y="p.y + p.widMm / 2 - (label(p.lenMm, p.widMm).showDims ? 6 : 0)"
         text-anchor="middle"

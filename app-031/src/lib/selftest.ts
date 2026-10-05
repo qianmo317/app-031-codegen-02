@@ -5,6 +5,14 @@ import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import {
+  mergeByCode,
+  parseRevisionText,
+  createRevision,
+  applyRevision,
+  rollbackToVersion,
+  type RevInputRow
+} from './revision'
 
 export interface CheckResult {
   name: string
@@ -74,7 +82,31 @@ function makeJob(parts: Part[], over: Partial<Job> = {}): Job {
     trimMm: over.trimMm ?? 8,
     useOffcutIds: [],
     batchByCabinet: false,
+    versionNo: over.versionNo ?? 1,
+    archives: over.archives ?? [],
+    exports: over.exports ?? [],
     ...over
+  }
+}
+
+function nestedJob(parts: Part[], over: Partial<Job> = {}): Job {
+  const job = makeJob(parts, over)
+  job.result = nestJob(job)
+  return job
+}
+
+function rowOf(p: Partial<Part> & { code: string }): RevInputRow {
+  return {
+    code: p.code,
+    name: p.name ?? '测试件',
+    lenMm: p.lenMm ?? null,
+    widMm: p.widMm ?? null,
+    qty: p.qty ?? null,
+    grain: p.grain ?? null,
+    edgeBands: p.edgeBands ?? null,
+    cabinet: p.cabinet ?? null,
+    exposed: p.exposed ?? null,
+    boardId: p.boardId ?? null
   }
 }
 
@@ -438,6 +470,207 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 改版：件号重复行并条（数量相加，规矩字段冲突取首行并警告）
+  {
+    const { map, warnings } = mergeByCode([
+      rowOf({ code: 'A', name: '件A', lenMm: 500, widMm: 400, qty: 2, grain: 'length' }),
+      rowOf({ code: 'A', name: '件A', lenMm: 500, widMm: 400, qty: 3, grain: 'length' }),
+      rowOf({ code: 'B', lenMm: 300, widMm: 200, qty: 1, grain: 'none' }),
+      rowOf({ code: 'B', lenMm: 300, widMm: 210, qty: 1, grain: 'none' })
+    ])
+    const a = map.get('A')!
+    const b = map.get('B')!
+    const ok =
+      a.qty === 5 && a.lenMm === 500 && b.qty === 2 && b.lenMm === 300 && b.warnings.length === 1 &&
+      warnings.length === 1 && warnings[0].includes('B')
+    add(
+      '改版并条：重复件号数量相加、规矩冲突取首行且警告',
+      ok,
+      ok ? `A.qty=${a.qty}（2+3），B.qty=${b.qty}，B 宽冲突已警告` : `A=${JSON.stringify({ q: a.qty })} B=${b.lenMm}×${b.widMm} warn=${b.warnings.length}`
+    )
+  }
+
+  // 11) 改版：缺字段按空值（长宽缺=0、数量缺=1、纹理=无、见光=否），解析不丢行
+  {
+    const { rows, errors } = parseRevisionText('A\t件A\t\t400\t\t\t\t柜\t\nB\t件B\t500\t\t2\t竖纹\t上下\t柜\t是')
+    const a = rows.find((r) => r.code === 'A')!
+    const b = rows.find((r) => r.code === 'B')!
+    const ok =
+      rows.length === 2 && a.lenMm === null && a.qty === null && errors.length >= 1 &&
+      b.widMm === null && b.grain === 'length' && b.exposed === true
+    add('改版解析：缺字段按空值保留且提示，不丢行', ok, ok ? `2 行全保留，缺字段提示 ${errors.length} 条` : `rows=${rows.length}, errors=${errors.length}`)
+  }
+
+  // 12) 改版：新增/删除/长宽变/数量变/纹理变 分类与逐项差值正确
+  {
+    const job = nestedJob([
+      makePart({ code: 'DEL', lenMm: 600, widMm: 300, qty: 2 }),
+      makePart({ code: 'SIZE', lenMm: 500, widMm: 400, qty: 1 }),
+      makePart({ code: 'QTY', lenMm: 400, widMm: 300, qty: 2, edgeBands: ['top'], exposed: true }),
+      makePart({ code: 'GR', lenMm: 400, widMm: 300, qty: 1, grain: 'none' }),
+      makePart({ code: 'KEEP', lenMm: 300, widMm: 200, qty: 1 })
+    ])
+    const rep = createRevision(job, {
+      newRows: [
+        rowOf({ code: 'SIZE', name: '测试件', lenMm: 700, widMm: 400, qty: 1, grain: 'none' }),
+        rowOf({ code: 'QTY', name: '测试件', lenMm: 400, widMm: 300, qty: 5, grain: 'none', edgeBands: ['top'], exposed: true }),
+        rowOf({ code: 'GR', name: '测试件', lenMm: 400, widMm: 300, qty: 1, grain: 'length' }),
+        rowOf({ code: 'KEEP', name: '测试件', lenMm: 300, widMm: 200, qty: 1, grain: 'none' }),
+        rowOf({ code: 'ADD', name: '测试件', lenMm: 350, widMm: 250, qty: 3, grain: 'none' })
+      ],
+      strategy: 'reuse'
+    })
+    const by = Object.fromEntries(rep.rows.map((r) => [r.code, r]))
+    const expectDPieces = 0 + 0 + 3 + 0 + 3 - 2 // SIZE0, QTY+3, GR0, KEEP0, ADD+3, DEL-2 = 4
+    const expectEdgeExp = (0.4 * 5 - 0.4 * 2) // QTY 见光顶边 400mm ×（5−2）= +1.2m
+    const ok =
+      by['ADD'].kind === 'added' && by['DEL'].kind === 'removed' &&
+      by['SIZE'].fields.includes('lenMm') && by['QTY'].fields.includes('qty') &&
+      by['GR'].fields.includes('grain') && by['KEEP'].kind === 'same' &&
+      rep.totals.dPieces === expectDPieces &&
+      Math.abs(rep.totals.dEdgeExposedM - expectEdgeExp) < 0.005 &&
+      by['GR'].forcesReopen && by['QTY'].forcesReopen && !by['QTY'].fields.includes('edgeBands')
+    add(
+      '改版分类与逐项差值（件数/封边/强制重开判定）',
+      ok,
+      ok
+        ? `件数差 ${rep.totals.dPieces}（期望 ${expectDPieces}）、见光封边差 ${rep.totals.dEdgeExposedM}m（期望 ${expectEdgeExp}）`
+        : `件数 ${rep.totals.dPieces}/${expectDPieces}，封边 ${rep.totals.dEdgeExposedM}/${expectEdgeExp}`
+    )
+  }
+
+  // 13) 改版：成本表按差得多→差得少；逐项合计=总表；两口径核对全绿
+  {
+    const job = nestedJob([
+      makePart({ code: 'A', lenMm: 800, widMm: 600, qty: 4 }),
+      makePart({ code: 'B', lenMm: 300, widMm: 200, qty: 2 })
+    ])
+    const rep = createRevision(job, {
+      newRows: [
+        rowOf({ code: 'A', name: '测试件', lenMm: 800, widMm: 600, qty: 6, grain: 'none' }),
+        rowOf({ code: 'B', name: '测试件', lenMm: 300, widMm: 200, qty: 2, grain: 'none' })
+      ],
+      strategy: 'renest'
+    })
+    let sorted = true
+    for (let i = 1; i < rep.rows.length; i++) {
+      if (Math.abs(rep.rows[i - 1].dBoardCents) < Math.abs(rep.rows[i].dBoardCents)) sorted = false
+    }
+    const sumCents = Math.round(rep.rows.reduce((a, r) => a + r.dBoardCents, 0))
+    const sumPieces = rep.rows.reduce((a, r) => a + r.dPieces, 0)
+    const checksOk = rep.checks.filter((c) => c.name.includes('逐项差值合计')).every((c) => c.ok)
+    const edgeCheck = rep.checks.find((c) => c.name.includes('封边'))!.ok
+    const piecesCheck = rep.checks.find((c) => c.name.includes('件数'))!.ok
+    const ok =
+      sorted && sumCents === rep.totals.dBoardCents && sumPieces === rep.totals.dPieces &&
+      checksOk && edgeCheck && piecesCheck
+    add(
+      '改版排序与核对：成本表差额降序，逐项合计=总表，封边/件数两口径对得上',
+      ok,
+      ok ? `逐项料钱和 ${sumCents}=合计，件数 ${sumPieces}，核对全绿` : `sorted=${sorted} cents=${sumCents}/${rep.totals.dBoardCents} edge=${edgeCheck}`
+    )
+  }
+
+  // 14) 改版应用·留用旧摆法：干净板留用 provenance=kept，受影响板 reopen，混排板 void 标废
+  {
+    // 放 3 组互不挤板的件，确保落在不同张：大件组同号同板，小改动只动其中一组
+    const parts: Part[] = []
+    for (let g = 0; g < 3; g++) {
+      parts.push(
+        makePart({ code: `G${g}-A`, lenMm: 1100, widMm: 1000, qty: 1 }),
+        makePart({ code: `G${g}-B`, lenMm: 1100, widMm: 140, qty: 1 })
+      )
+    }
+    const job = nestedJob(parts)
+    const sheetsBefore = job.result!.sheets.length
+    const oldCostBySheet = job.result!.sheets.map((s) => s.priceCents)
+    // 新版：删掉 G0-B（与 G0-A 同板 → G0 板变混排：A 留切、B 标废），新增一件随重排
+    const rep = createRevision(job, {
+      newRows: [
+        ...parts.filter((p) => p.code !== 'G0-B').map((p) =>
+          rowOf({ code: p.code, name: p.name, lenMm: p.lenMm, widMm: p.widMm, qty: p.qty, grain: p.grain })
+        ),
+        rowOf({ code: 'NEW', name: '测试件', lenMm: 400, widMm: 300, qty: 1, grain: 'none' })
+      ],
+      strategy: 'reuse'
+    })
+    const { result } = applyRevision(job, rep, 'reuse')
+    const kept = result.sheets.filter((s) => s.provenance === 'kept')
+    const mixed = result.sheets.filter((s) => s.provenance === 'mixed')
+    const reopen = result.sheets.filter((s) => s.provenance === 'reopen')
+    const voids = result.sheets.flatMap((s) => s.placements.filter((p) => p.void))
+    const version = job.versionNo === 2 && job.archives!.length === 1 &&
+      job.archives![0].metrics.boardsUsed === sheetsBefore
+    const ok =
+      kept.length >= 1 && mixed.length === 1 && reopen.length >= 1 &&
+      voids.length === 1 && voids[0].code === 'G0-B' && version
+    // 落账成本：重排新板钱 − 省掉的重开旧板钱（混排板照旧切不补不省）
+    const savedOldCost = rep.reuse.reopenSheets.reduce((a, i) => a + oldCostBySheet[i], 0)
+    const ledgerExpect =
+      reopen.reduce((a, s) => a + s.priceCents, 0) - savedOldCost
+    const ledgerOk = rep.totals.ledgerBoardCents === ledgerExpect
+    add(
+      '改版留用：干净板留用/混排板照旧切且标废/受影响件重开，旧版自动存档，落账成本守恒',
+      ok && ledgerOk,
+      ok && ledgerOk
+        ? `旧 ${sheetsBefore} 张 → 留用 ${kept.length}、混切 ${mixed.length}（标废 ${voids.length}）、重开 ${reopen.length}；落账 ${rep.totals.ledgerBoardCents} 分（期望 ${ledgerExpect}）；存档 1 份`
+        : `kept=${kept.length} mixed=${mixed.length} reopen=${reopen.length} void=${voids.map((v) => v.code).join(',')} archive=${job.archives?.length} ledger=${rep.totals.ledgerBoardCents}/${ledgerExpect}`
+    )
+  }
+
+  // 15) 改版应用·整批重排：全部 provenance=reopen；旧导出全部作废
+  {
+    const job = nestedJob([
+      makePart({ code: 'A', lenMm: 700, widMm: 600, qty: 2 }),
+      makePart({ code: 'B', lenMm: 400, widMm: 300, qty: 1 })
+    ])
+    job.exports = [
+      { id: 'e1', versionNo: 1, sections: ['下料单'], createdAt: 1, voided: false },
+      { id: 'e2', versionNo: 1, sections: ['标签'], createdAt: 2, voided: false }
+    ]
+    const rep = createRevision(job, {
+      newRows: [
+        rowOf({ code: 'A', name: '测试件', lenMm: 700, widMm: 600, qty: 3, grain: 'none' })
+      ],
+      strategy: 'renest'
+    })
+    const { result, reopenedAll } = applyRevision(job, rep, 'renest')
+    const allReopen = result.sheets.every((s) => s.provenance === 'reopen')
+    const exportsVoid = job.exports!.every((e) => e.voided)
+    const ok = reopenedAll && allReopen && exportsVoid
+    add(
+      '改版整批重排：所有板重开且旧版已发清单全部作废',
+      ok,
+      ok ? `${result.sheets.length} 张全部重开，2 份旧导出均作废` : `reopenedAll=${reopenedAll}, allReopen=${allReopen}, void=${exportsVoid}`
+    )
+  }
+
+  // 16) 回退：恢复旧版清单与那组数，回退期间导出作废；旧版 metrics 未被新版盖掉
+  {
+    const job = nestedJob([makePart({ code: 'A', lenMm: 600, widMm: 500, qty: 2 })])
+    const oldMetrics = { ...job.result!.edgeBandM, boards: job.result!.boardsUsed, cost: job.result!.totalCostCents }
+    const rep = createRevision(job, {
+      newRows: [rowOf({ code: 'A', name: '测试件', lenMm: 600, widMm: 500, qty: 5, grain: 'none' })],
+      strategy: 'renest'
+    })
+    applyRevision(job, rep, 'renest')
+    const v2parts = job.parts.length
+    // 再导出一份 v2，然后回退到 v1
+    job.exports!.push({ id: 'e3', versionNo: 2, sections: ['下料单'], createdAt: 3, voided: false })
+    rollbackToVersion(job, 1)
+    const qty = job.parts.find((p) => p.code === 'A')!.qty
+    const e3void = job.exports!.find((e) => e.id === 'e3')!.voided
+    const metricsKept =
+      job.archives!.find((a) => a.versionNo === 1)!.metrics.boardsUsed === oldMetrics.boards &&
+      job.archives!.find((a) => a.versionNo === 1)!.metrics.totalCostCents === oldMetrics.cost
+    const ok = qty === 2 && e3void && job.versionNo === 1 && metricsKept && v2parts === 1
+    add(
+      '改版回退：旧版清单与当时用板/料钱可查，回退期间导出作废重发',
+      ok,
+      ok ? `A.qty=${qty}，v2 导出已作废，v1 存档 ${oldMetrics.boards} 张未被覆盖` : `qty=${qty}, e3void=${e3void}, kept=${metricsKept}`
     )
   }
 

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob, runNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
+import { getJob, rerunNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
 import { toast } from '../lib/ui'
 import { printJob } from '../lib/print'
 import { pct, money } from '../lib/format'
@@ -11,6 +11,7 @@ import { cabinetFill, cabinetStroke } from '../lib/colors'
 const route = useRoute()
 const job = computed(() => getJob(route.params.id as string))
 const result = computed(() => job.value?.result)
+const revision = computed(() => job.value?.revision)
 
 const activeSheet = ref(0)
 const sheet = computed(() => result.value?.sheets[activeSheet.value])
@@ -66,7 +67,7 @@ function registerAll(): void {
 
 function rerun(): void {
   if (!job.value) return
-  runNest(job.value)
+  rerunNest(job.value)
   activeSheet.value = 0
   toast('已重新排样', 'good')
 }
@@ -155,8 +156,20 @@ function printNest(): void {
       <router-link class="sm btn-like" :to="`/cut/${job.id}`">看裁切步骤 →</router-link>
     </section>
 
-    <div v-if="result.unplaced.length > 0" class="alert bad">
-      <b>{{ result.unplaced.reduce((a, u) => a + u.qty, 0) }} 件未排下：</b>
+    <section v-if="revision?.status === 'applied'" class="panel rev-nest-bar">
+      <div class="row wrap">
+        <b>第 {{ job!.versionNo }} 版排样（改版已应用，三处同源）：</b>
+        <span class="tag good">留用 {{ result.sheets.filter((s) => s.provenance === 'kept').length }} 张</span>
+        <span class="tag warn">混排照旧切 {{ result.sheets.filter((s) => s.provenance === 'mixed').length }} 张</span>
+        <span class="tag bad">重开 {{ result.sheets.filter((s) => s.provenance === 'reopen').length }} 张</span>
+        <span v-if="revision.strategy === 'renest'" class="tag">整批重排：所有板均为重开</span>
+        <div class="spacer" />
+        <router-link class="sm btn-like" :to="`/revision/${job!.id}`">改版核定 →</router-link>
+        <router-link class="sm btn-like" :to="`/cut/${job!.id}`">工单重开 →</router-link>
+      </div>
+    </section>
+
+    <div v-if="result.unplaced.length > 0" class="alert bad">      <b>{{ result.unplaced.reduce((a, u) => a + u.qty, 0) }} 件未排下：</b>
       <span v-for="u in result.unplaced" :key="u.partId" class="alert-item">
         {{ u.code }}（{{ u.name }}）×{{ u.qty }}：{{ u.reason }}
       </span>
@@ -177,6 +190,9 @@ function printNest(): void {
         >
           <b>第 {{ s.index + 1 }} 张</b>
           <span>{{ s.boardName.length > 14 ? s.material + ' ' + s.thicknessMm + 'mm' : s.boardName }}</span>
+          <span v-if="s.provenance === 'kept'" class="tag good prov">留用</span>
+          <span v-else-if="s.provenance === 'mixed'" class="tag warn prov">混切</span>
+          <span v-else-if="s.provenance === 'reopen'" class="tag bad prov">重开</span>
           <span class="ut">{{ pct(s.utilization) }}</span>
         </button>
       </aside>
@@ -298,6 +314,14 @@ function printNest(): void {
   padding: 5px 10px;
   font-size: 12px;
   text-decoration: none;
+}
+.rev-nest-bar {
+  margin-bottom: 10px;
+  border-color: #bfe3cc;
+  background: var(--c-good-bg);
+}
+.sheet-tab .prov {
+  align-self: flex-start;
 }
 .alert {
   border-radius: 8px;

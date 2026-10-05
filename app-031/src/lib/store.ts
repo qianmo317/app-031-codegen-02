@@ -1,10 +1,18 @@
 // 全局状态：Vue reactive 单例 + localStorage 持久化（无 Pinia/Vuex）
 import { reactive, computed } from 'vue'
-import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from '../types'
+import type { Board, Job, NestResult, Part, RegisteredOffcut, RevStrategy, RevisionReport, SheetResult, VersionArchive } from '../types'
 import { nestJob } from './packing'
 import { rebuildFromPlacements } from './cuts'
 import { guillotineViolation } from './geometry'
 import { uid } from './format'
+import {
+  applyRevision as engineApplyRevision,
+  archiveCurrent as engineArchiveCurrent,
+  createRevision as engineCreateRevision,
+  recordExport as engineRecordExport,
+  rollbackToVersion as engineRollback,
+  type RevInputRow
+} from './revision'
 import boardsData from '../data/boards.json'
 
 const JOBS_KEY = 'fco.jobs.v1'
@@ -84,7 +92,10 @@ export function createJob(name: string): Job {
     kerfMm: boardsData.defaults.kerfMm,
     trimMm: boardsData.defaults.trimMm,
     useOffcutIds: [],
-    batchByCabinet: false
+    batchByCabinet: false,
+    versionNo: 1,
+    archives: [],
+    exports: []
   }
   state.jobs.unshift(job)
   persist()
@@ -154,6 +165,87 @@ export function runNest(job: Job): NestResult {
   job.result = result
   persist()
   return result
+}
+
+// ───────── 改版影响核定：明细页 / 工单页 / 统计页共用同一份 job.revision ─────────
+
+/**
+ * 做改版影响核定（只算这一次，三处页面同源）。
+ * 旧版必须已有本机存档的排样结果——那组数即“改版以前算出来的数”，不会被重算盖掉。
+ * 改版只在常规板上重排（旧版排样时登记余料可能已被消耗，避免重复使用同一块余料）。
+ */
+export function createRevision(job: Job, newRows: RevInputRow[], strategy: RevStrategy): RevisionReport {
+  const report = engineCreateRevision(job, { newRows, strategy })
+  job.revision = report
+  persist()
+  return report
+}
+
+/** 重新排样：日常重排作废未发出核定，避免明细页已改、工单页挂旧版。 */
+export function rerunNest(job: Job): NestResult {
+  if (job.revision?.status === 'draft') job.revision = undefined
+  return runNest(job)
+}
+
+/** 切换两条路线：两版明细不变，但落账成本口径要按新策略重算。 */
+export function setRevisionStrategy(job: Job, strategy: RevStrategy): RevisionReport | undefined {
+  if (!job.revision) return undefined
+  if (strategy === job.revision.strategy) return job.revision
+  const fresh = engineCreateRevision(job, {
+    newRows: job.revision.newParts.map((p) => ({
+      code: p.code,
+      name: p.name,
+      lenMm: p.lenMm || null,
+      widMm: p.widMm || null,
+      qty: p.qty ?? null,
+      grain: p.grain,
+      edgeBands: p.edgeBands,
+      cabinet: p.cabinet || null,
+      exposed: p.exposed,
+      boardId: p.boardId || null
+    })),
+    strategy
+  })
+  // 保留核定身份与草稿状态，只换策略对应的那组数
+  job.revision = {
+    ...fresh,
+    id: job.revision.id,
+    createdAt: job.revision.createdAt
+  }
+  persist()
+  return job.revision
+}
+
+export function clearRevision(job: Job): void {
+  job.revision = undefined
+  persist()
+}
+
+/** 应用改版（二选一：整批重排 / 留用旧摆法）。旧版自动存档、已发清单全部作废。 */
+export function applyRevision(job: Job, strategy: RevStrategy): NestResult {
+  if (!job.revision) throw new Error('还没有改版核定')
+  const { result } = engineApplyRevision(job, job.revision, strategy)
+  persist()
+  return result
+}
+
+/** 回退到指定历史版本（存档只读保留；回退期间的导出清单自动作废、提示重发）。 */
+export function rollbackJob(job: Job, versionNo: number): void {
+  engineRollback(job, versionNo)
+  persist()
+}
+
+/** 手工存档当前版本（例如本机存档节点）。 */
+export function snapshotJob(job: Job, reason: string): VersionArchive {
+  engineArchiveCurrent(job, reason)
+  persist()
+  return job.archives![0]
+}
+
+/** 登记一次本机导出/打印（下料单发出台账），返回该记录。 */
+export function registerJobExport(job: Job, sections: string[]): void {
+  engineRecordExport(job, sections)
+  persist()
 }
 
 /** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */

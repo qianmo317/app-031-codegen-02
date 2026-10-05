@@ -130,7 +130,8 @@ function onFile(e: Event): void {
         </span>
         <span class="muted small">
           覆盖：100 组 guillotine 零反例、纹理零旋转、锯路/修边、守恒、封边复算、
-          30 件 ≤20 刀且逐刀模拟还原、余料再利用、300 件 &lt;1.5s、微调合法性
+          30 件 ≤20 刀且逐刀模拟还原、余料再利用、300 件 &lt;1.5s、微调合法性；
+          改版并条/缺字段/逐项差值/成本表排序/核对/留用与整批重排/作废回退共 7 组专项断言
         </span>
       </div>
       <table v-if="report" class="grid" style="margin-top: 10px">
@@ -153,6 +154,9 @@ function onFile(e: Event): void {
         <div class="row">
           <h3 style="font-size: 15px">{{ job.name }}</h3>
           <div class="spacer" />
+          <span class="tag">第 {{ job.versionNo ?? 1 }} 版</span>
+          <span v-if="job.revision?.status === 'draft'" class="tag warn">改版草稿</span>
+          <span v-else-if="job.revision?.status === 'applied'" class="tag good">已改版</span>
           <span v-if="job.result" class="tag good">已排样</span>
           <span v-else class="tag">未排样</span>
         </div>
@@ -179,12 +183,16 @@ function onFile(e: Event): void {
         <div v-else style="height: 34px"></div>
         <div class="row">
           <router-link :to="`/parts/${job.id}`" class="btn-link">零件清单</router-link>
+          <router-link :to="`/revision/${job.id}`" class="btn-link">改版核定</router-link>
           <router-link :to="`/nest/${job.id}`" class="btn-link">排样</router-link>
           <router-link :to="`/stats/${job.id}`" class="btn-link">统计</router-link>
           <div class="spacer" />
           <button class="sm" @click="onDuplicate(job.id)">复制</button>
           <button class="sm ghost-danger" @click="onDelete(job.id, job.name)">删除</button>
         </div>
+        <p v-if="(job.exports?.filter((e) => e.voided).length ?? 0) > 0" class="small" style="color: var(--c-bad); margin-top: 6px">
+          ⚠️ {{ job.exports!.filter((e) => e.voided).length }} 份已发下料单已作废，请到导出页按第 {{ job.versionNo ?? 1 }} 版重发
+        </p>
       </article>
     </div>
   </div>

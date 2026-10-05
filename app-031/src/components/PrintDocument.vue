@@ -12,8 +12,25 @@ const now = computed(() => new Date().toLocaleString('zh-CN'))
 
 const allInstances = computed(() => {
   if (!job.value?.result) return []
-  return job.value.result.sheets.flatMap((s) => s.placements)
+  // 改版混排板上的标废件不再列入下料/标签，避免车间切到废弃件
+  return job.value.result.sheets.flatMap((s) => s.placements.filter((p) => !p.void))
 })
+const voidInstances = computed(() => {
+  if (!job.value?.result) return []
+  return job.value.result.sheets.flatMap((s) => s.placements.filter((p) => p.void))
+})
+const revision = computed(() => job.value?.revision)
+function sgn(v: number): string {
+  return v > 0 ? `+${v}` : `${v}`
+}
+function sgnMoney(c: number): string {
+  return c > 0 ? `+${money(c)}` : money(c)
+}
+const provenanceText: Record<string, string> = {
+  kept: '旧单留用（刀路不变）',
+  mixed: '混排照旧切（红叉件标废勿切，其余回头切）',
+  reopen: '改版重开新单'
+}
 
 interface OrderRow {
   code: string
@@ -56,6 +73,73 @@ const boardByName = (name: string) =>
 
 <template>
   <div v-if="job" class="print-doc print-only">
+    <!-- 改版影响核定页（三处同源那组数；已应用后随下料单一并发出） -->
+    <div v-if="revision && sections.has('order')">
+      <section class="print-page">
+        <h2>改版影响核定 · 第 {{ job.versionNo ?? 1 }} 版</h2>
+        <p class="doc-meta">
+          项目：{{ job.name }} ｜ 核定时间：{{ new Date(revision.createdAt).toLocaleString('zh-CN') }} ｜
+          路线：{{ revision.strategy === 'renest' ? '整批重排（旧摆法/刀路全废）' : '留用旧摆法（混排板回头切）' }}
+        </p>
+        <table class="pgrid">
+          <thead>
+            <tr><th>项目</th><th>旧版</th><th>新版</th><th>差值（新−旧）</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>用板张数（领料实算）</td>
+              <td>{{ revision.oldExact.boardsUsed }}</td>
+              <td>{{ revision.newExact.boardsUsed }}</td>
+              <td><b>{{ sgn(revision.totals.dSheetsExact) }} 张</b></td>
+            </tr>
+            <tr>
+              <td>板材花费</td>
+              <td>{{ money(revision.oldExact.totalCostCents) }}</td>
+              <td>{{ money(revision.newExact.totalCostCents) }}</td>
+              <td><b>{{ sgnMoney(revision.totals.dBoardCentsExact) }}</b></td>
+            </tr>
+            <tr>
+              <td>见光边封边(m)</td>
+              <td>{{ revision.oldExact.edgeExposedM.toFixed(2) }}</td>
+              <td>{{ revision.newExact.edgeExposedM.toFixed(2) }}</td>
+              <td>{{ sgn(revision.totals.dEdgeExposedM) }}</td>
+            </tr>
+            <tr>
+              <td>非见光边封边(m)</td>
+              <td>{{ revision.oldExact.edgeNormalM.toFixed(2) }}</td>
+              <td>{{ revision.newExact.edgeNormalM.toFixed(2) }}</td>
+              <td>{{ sgn(revision.totals.dEdgeNormalM) }}</td>
+            </tr>
+            <tr v-for="h in revision.totals.dHardware" :key="h.name">
+              <td>{{ h.name }}</td><td>—</td><td>—</td>
+              <td>{{ sgn(h.value) }} {{ h.unit }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <h3>工单处置（与明细页、统计页同源）</h3>
+        <table class="pgrid">
+          <tbody>
+            <tr>
+              <td>旧单留用</td>
+              <td>{{ revision.reuse.keptSheets.length }} 张 / {{ revision.reuse.keptPieces }} 件，板与刀路不动</td>
+            </tr>
+            <tr>
+              <td>混排照旧切</td>
+              <td>{{ revision.reuse.mixedSheets.length }} 张；{{ revision.reuse.backCutPieces }} 件回头切（返机 {{ revision.reuse.extraBackCuts }} 次），{{ revision.reuse.voidPieces }} 件标废勿切</td>
+            </tr>
+            <tr>
+              <td>必须重开</td>
+              <td>{{ revision.strategy === 'renest' ? '整批全部重开' : `${revision.reuse.reopenSheets.length} 张 / ${revision.reuse.reopenPieces} 件 + 新增件` }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="doc-meta" style="margin-top: 6px">
+          单位精度：长度 mm；面积 m² 两位；封边 m 两位（净边长）；折算张三位（净面积/板毛面积）；
+          金额元取到分。领料与成本以整单重排实算为准；逐项折算合计已与总表核对一致。
+        </p>
+      </section>
+    </div>
+
     <!-- 排样图 -->
     <div v-if="sections.has('nest')">
       <section
@@ -63,11 +147,17 @@ const boardByName = (name: string) =>
         :key="'pn' + s.index"
         class="print-page"
       >
-        <h2>排样图 · 第 {{ s.index + 1 }} 张 / 共 {{ job.result?.sheets.length }} 张</h2>
+        <h2>
+          排样图 · 第 {{ s.index + 1 }} 张 / 共 {{ job.result?.sheets.length }} 张
+          <span v-if="s.provenance" class="prov-badge" :class="s.provenance">
+            {{ provenanceText[s.provenance] }}
+          </span>
+        </h2>
         <p class="doc-meta">
           {{ s.boardName }}（{{ s.material }} {{ s.thicknessMm }}mm） · 尺寸
           {{ s.wMm }}×{{ s.hMm }}mm · 利用率 {{ (s.utilization * 100).toFixed(1) }}% ·
-          锯路 {{ job.kerfMm }}mm · 修边 {{ job.trimMm }}mm
+          锯路 {{ job.kerfMm }}mm · 修边 {{ job.trimMm }}mm ·
+          版本 第 {{ job.versionNo ?? 1 }} 版
         </p>
         <div class="print-sheet-wrap">
           <SheetDiagram :sheet="s" :show-cuts="false" print-mode />
@@ -80,9 +170,9 @@ const boardByName = (name: string) =>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="p in s.placements" :key="p.instanceId">
+            <tr v-for="p in s.placements" :key="p.instanceId" :class="{ 'void-row': p.void }">
               <td>{{ p.seq }}</td>
-              <td>{{ p.code }}</td>
+              <td>{{ p.code }}{{ p.void ? '（废）' : '' }}</td>
               <td>{{ p.name }}</td>
               <td>{{ p.cabinet }}</td>
               <td>{{ mm(p.origLen) }}×{{ mm(p.origWid) }}</td>
@@ -102,8 +192,14 @@ const boardByName = (name: string) =>
         :key="'pc' + s.index"
         class="print-page"
       >
-        <h2>裁切步骤表 · 第 {{ s.index + 1 }} 张（{{ s.boardName }}）</h2>
-        <p class="doc-meta">按顺序下锯；同向刀已连续排程（减少推台翻转）；修边刀可多板叠切。</p>
+        <h2>
+          裁切步骤表 · 第 {{ s.index + 1 }} 张（{{ s.boardName }}）
+          <span v-if="s.provenance" class="prov-badge" :class="s.provenance">{{ provenanceText[s.provenance] }}</span>
+        </h2>
+        <p class="doc-meta">
+          按顺序下锯；同向刀已连续排程（减少推台翻转）；修边刀可多板叠切。
+          <template v-if="s.placements.some((p) => p.void)">本板含改版标废件，下锯跳过标废位置。</template>
+        </p>
         <table class="pgrid">
           <thead>
             <tr><th>刀序</th><th>类型</th><th>方向</th><th>位置(mm)</th><th>贯通区间(mm)</th><th>说明</th></tr>
@@ -125,8 +221,11 @@ const boardByName = (name: string) =>
     <!-- 下料单 / 领料单 -->
     <div v-if="sections.has('order')">
       <section class="print-page">
-        <h2>下料单 / 领料单</h2>
-        <p class="doc-meta">项目：{{ job.name }} ｜ 打印时间：{{ now }}</p>
+        <h2>下料单 / 领料单（第 {{ job.versionNo ?? 1 }} 版）</h2>
+        <p class="doc-meta">
+          项目：{{ job.name }} ｜ 版本：第 {{ job.versionNo ?? 1 }} 版 ｜ 打印时间：{{ now }}
+          <template v-if="revision"> ｜ 改版路线：{{ revision.strategy === 'renest' ? '整批重排' : '留用旧摆法' }}</template>
+        </p>
 
         <h3>一、板材领料</h3>
         <table class="pgrid">
@@ -172,7 +271,23 @@ const boardByName = (name: string) =>
           </table>
         </div>
 
-        <h3>三、封边与五金辅料</h3>
+        <h3 v-if="voidInstances.length > 0" style="color: #991b1b">三、混排板标废件（下锯跳过，勿发料）</h3>
+        <table v-if="voidInstances.length > 0" class="pgrid" style="margin-bottom: 8px">
+          <thead>
+            <tr><th>件号</th><th>名称</th><th>所在板</th><th>尺寸(mm)</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="(p, i) in voidInstances" :key="'v' + i" class="void-row">
+              <td>{{ p.code }}</td>
+              <td>{{ p.name }}</td>
+              <td>第 {{ p.boardIndex + 1 }} 张</td>
+              <td>{{ mm(p.origLen) }}×{{ mm(p.origWid) }}</td>
+              <td>{{ p.voidReason ?? '改版废弃件' }}</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>四、封边与五金辅料</h3>
         <table class="pgrid">
           <tbody>
             <tr><td>见光边封边</td><td>{{ job.result?.edgeBandM.exposed }} m</td></tr>
@@ -228,6 +343,31 @@ const boardByName = (name: string) =>
   color: #333;
   margin: 0 0 8px;
   font-size: 11px;
+}
+.prov-badge {
+  font-size: 11px;
+  font-weight: 400;
+  border: 1px solid;
+  border-radius: 3px;
+  padding: 1px 5px;
+  margin-left: 8px;
+}
+.prov-badge.kept {
+  color: #166534;
+  border-color: #166534;
+}
+.prov-badge.mixed {
+  color: #92600a;
+  border-color: #92600a;
+}
+.prov-badge.reopen {
+  color: #991b1b;
+  border-color: #991b1b;
+}
+table.pgrid tr.void-row {
+  background: #f3d9d9 !important;
+  color: #991b1b;
+  text-decoration: line-through;
 }
 .print-sheet-wrap {
   border: 1px solid #888;
